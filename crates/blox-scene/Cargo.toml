@@ -1,0 +1,9 @@
+[package]
+name = "blox-scene"
+description = "Turns decoded Roblox models into renderable Bevy geometry"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bevy.workspace = true
+blox-model.workspace = true

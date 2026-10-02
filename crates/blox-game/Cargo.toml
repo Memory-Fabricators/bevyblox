@@ -1,0 +1,11 @@
+[package]
+name = "blox-game"
+description = "Bevy viewer for Roblox models and places"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bevy.workspace = true
+bevy_rapier3d.workspace = true
+blox-model.workspace = true
+blox-scene.workspace = true

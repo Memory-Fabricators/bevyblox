@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", features = ["jpeg"] }
+bevy_rapier3d = { git = "https://github.com/dimforge/rapier", default-features = false, features = ["dim3", "async-collider"] }
+blox-model = { path = "crates/blox-model" }
+blox-scene = { path = "crates/blox-scene" }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1
+split-debuginfo = "packed"
+debuginfo = "line-tables-only"
+

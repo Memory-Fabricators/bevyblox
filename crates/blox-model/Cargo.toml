@@ -1,0 +1,5 @@
+[package]
+name = "blox-model"
+description = "Native readers for Roblox XML and binary model/place files"
+version.workspace = true
+edition.workspace = true
