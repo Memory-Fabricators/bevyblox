@@ -370,8 +370,8 @@ fn setup_renderer(world: &mut World) {
         .zip(part_images)
     {
         let block = part.geometry == Geometry::Block;
-        let surface = blox_scene::material::surface_material(part.material)
-            .filter(|_| block && part_image.is_none());
+        let surface =
+            blox_scene::material::surface_material(part.material).filter(|_| part_image.is_none());
         let mut appearance = Appearance {
             // A textured mesh takes its color from the texture, not the part color.
             color: if part_image.is_some() {

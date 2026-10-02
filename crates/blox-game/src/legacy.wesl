@@ -165,10 +165,14 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         let face = face_of(transpose(basis) * in.world_normal);
         let surface = (material.packed.x >> (4u * face)) & 15u;
         let uv = face_uv(face, p, size);
-        let uv_dx = dpdx(uv);
-        let uv_dy = dpdy(uv);
-        // Tangent frame: u axis, its perpendicular in the face, and the normal.
-        let tangent = normalize(basis * face_tangent(face));
+        // Differentiate position before selecting a projection. Adjacent pixels can choose
+        // different faces on curved meshes; differentiating their UVs would spike the mip.
+        let uv_dx = face_uv(face, p + dpdx(p), size) - uv;
+        let uv_dy = face_uv(face, p + dpdy(p), size) - uv;
+        // Project the U direction onto the actual surface, including wedge slopes and
+        // curved geometry. Dominant-axis selection keeps this vector away from zero.
+        let projected_tangent = basis * face_tangent(face);
+        let tangent = normalize(projected_tangent - n * dot(n, projected_tangent));
         let bitangent = cross(n, tangent);
 
         if ((flags & FLAG_STUDS) != 0u) {
