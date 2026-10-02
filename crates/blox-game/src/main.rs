@@ -1,6 +1,10 @@
 use std::{collections::HashMap, path::PathBuf};
 
-use bevy::{app::AppExit, prelude::*};
+use bevy::core_pipeline::tonemapping::DebandDither;
+use bevy::{
+    app::AppExit, core_pipeline::Skybox, light::CascadeShadowConfigBuilder, prelude::*,
+    render::view::Tonemapping,
+};
 use blox_model::Model;
 use blox_scene::{
     Geometry, SceneSnapshot, decal, mesh,
@@ -8,8 +12,11 @@ use blox_scene::{
 };
 
 mod first_person;
+mod legacy;
 mod walk;
+use blox_scene::lighting::Lighting;
 use first_person::{FirstPersonCamera, FirstPersonPlugin, InitialView, Locomotion};
+use legacy::{Appearance, LegacyMaterial, LegacyRenderPlugin};
 
 #[derive(Resource)]
 struct PreparedScene {
@@ -22,6 +29,8 @@ struct PreparedScene {
     radius: f32,
     /// Static collision shape per part (`None` for `CanCollide = false` or unusable meshes).
     colliders: Vec<Option<bevy_rapier3d::prelude::Collider>>,
+    lighting: Lighting,
+    content: PathBuf,
 }
 
 /// A decal/texture drawn over its part with the part's transform.
@@ -139,7 +148,11 @@ fn main() -> Result<AppExit, Box<dyn std::error::Error>> {
     for omission in &snapshot.omissions {
         eprintln!("Not rendered: {omission}");
     }
-    let prepared = prepare(snapshot, &root.join("content"))?;
+    let prepared = prepare(
+        snapshot,
+        Lighting::from_model(&model)?,
+        &root.join("content"),
+    )?;
     let initial_view = InitialView::from_model(&model, prepared.center)?;
     println!(
         "Camera starts at {:?}, FOV {:.1}°",
@@ -159,7 +172,7 @@ fn main() -> Result<AppExit, Box<dyn std::error::Error>> {
             }),
             ..default()
         }))
-        .insert_resource(ClearColor(Color::srgb(0.12, 0.16, 0.22)))
+        .add_plugins(LegacyRenderPlugin)
         .add_plugins(FirstPersonPlugin)
         .add_plugins(walk::WalkPlugin)
         .add_systems(Startup, setup_renderer);
@@ -168,6 +181,7 @@ fn main() -> Result<AppExit, Box<dyn std::error::Error>> {
 
 fn prepare(
     snapshot: SceneSnapshot,
+    lighting: Lighting,
     content: &std::path::Path,
 ) -> Result<PreparedScene, Box<dyn std::error::Error>> {
     let mut meshes = Vec::new();
@@ -260,8 +274,7 @@ fn prepare(
         .parts
         .iter()
         .zip(&mesh_indices)
-        .zip(&transforms)
-        .map(|((part, &mesh), transform)| {
+        .map(|(part, &mesh)| {
             if !part.can_collide {
                 return None;
             }
@@ -280,6 +293,8 @@ fn prepare(
         center,
         radius,
         colliders,
+        lighting,
+        content: content.to_path_buf(),
     })
 }
 
@@ -309,8 +324,10 @@ fn setup_renderer(world: &mut World) {
         decals,
         ..
     } = prepared.surfaces;
+    let lighting = prepared.lighting;
+    let shading = lighting.shading();
     // One material per distinct appearance so Bevy can batch the thousands of parts in a place.
-    let mut materials: HashMap<[u32; 6], Handle<StandardMaterial>> = HashMap::new();
+    let mut materials: HashMap<Vec<u32>, Handle<LegacyMaterial>> = HashMap::new();
     for (((part, mesh_index), transform), part_image) in prepared
         .snapshot
         .parts
@@ -319,40 +336,59 @@ fn setup_renderer(world: &mut World) {
         .zip(&prepared.transforms)
         .zip(part_images)
     {
-        // A textured mesh takes its color from the texture, not the part color.
-        let tint = match part_image {
-            Some(_) => [1.0; 3],
-            None => part.color_srgb,
+        let plastic = part.material == 256;
+        let block = part.geometry == Geometry::Block;
+        let mut flags = 0;
+        if plastic && block && part.plain_shape {
+            flags |= legacy::FLAG_STUDS;
+        }
+        if lighting.outlines && block {
+            flags |= legacy::FLAG_OUTLINE;
+        }
+        if part_image.is_some() {
+            flags |= legacy::FLAG_TEXTURE;
+        }
+        if part.material == 288 {
+            flags |= legacy::FLAG_UNLIT;
+        }
+        // GeometryGenerator.cpp::getPartTransparency: reflectance only thins Plastic.
+        let transparency = if plastic {
+            part.transparency * (1.0 - part.reflectance * 0.8)
+        } else {
+            part.transparency
         };
-        let key = [
-            tint[0].to_bits(),
-            tint[1].to_bits(),
-            tint[2].to_bits(),
-            part.transparency.to_bits(),
-            part.reflectance.to_bits(),
+        let appearance = Appearance {
+            // A textured mesh takes its color from the texture, not the part color.
+            color: if part_image.is_some() {
+                [1.0; 3]
+            } else {
+                part.color_srgb
+            },
+            alpha: 1.0 - (transparency.clamp(0.0, 1.0) * 255.0).floor() / 255.0,
+            specular: legacy::specular(part.material),
+            flags,
+            surfaces: part.surfaces,
+            texture: part_image.map(|i| images[i].clone()),
+        };
+        let key = vec![
+            appearance.color[0].to_bits(),
+            appearance.color[1].to_bits(),
+            appearance.color[2].to_bits(),
+            appearance.alpha.to_bits(),
+            appearance.specular.0.to_bits(),
+            appearance.specular.1.to_bits(),
+            flags,
+            part.surfaces
+                .iter()
+                .fold(0, |bits, s| bits << 4 | u32::from(*s)),
             part_image.map_or(u32::MAX, |i| i as u32),
         ];
         let material = materials
             .entry(key)
             .or_insert_with(|| {
                 world
-                    .resource_mut::<Assets<StandardMaterial>>()
-                    .add(StandardMaterial {
-                        base_color: Color::srgba(
-                            tint[0],
-                            tint[1],
-                            tint[2],
-                            1.0 - part.transparency,
-                        ),
-                        base_color_texture: part_image.map(|i| images[i].clone()),
-                        alpha_mode: if part.transparency == 0.0 {
-                            AlphaMode::Opaque
-                        } else {
-                            AlphaMode::Blend
-                        },
-                        reflectance: part.reflectance,
-                        ..default()
-                    })
+                    .resource_mut::<Assets<LegacyMaterial>>()
+                    .add(LegacyMaterial::new(&lighting, &shading, &appearance))
             })
             .clone();
         world.spawn((
@@ -378,17 +414,22 @@ fn setup_renderer(world: &mut World) {
         }
     }
     for draw in decals {
-        let material = world
-            .resource_mut::<Assets<StandardMaterial>>()
-            .add(StandardMaterial {
-                base_color: Color::srgba(1.0, 1.0, 1.0, 1.0 - draw.transparency),
-                base_color_texture: Some(images[draw.image].clone()),
-                alpha_mode: AlphaMode::Blend,
-                reflectance: 0.0,
-                // Legacy decals use a rasterizer depth bias of -16 to win against the part.
-                depth_bias: 16.0 + draw.order as f32,
-                ..default()
-            });
+        let mut material = LegacyMaterial::new(
+            &lighting,
+            &shading,
+            &Appearance {
+                color: [1.0; 3],
+                alpha: 1.0 - draw.transparency,
+                specular: legacy::specular(256),
+                flags: legacy::FLAG_TEXTURE,
+                surfaces: [0; 6],
+                texture: Some(images[draw.image].clone()),
+            },
+        );
+        material.alpha_mode = AlphaMode::Blend;
+        // Legacy decals use a rasterizer depth bias of -16 to win against the part.
+        material.depth_bias = 16.0 + draw.order as f32;
+        let material = world.resource_mut::<Assets<LegacyMaterial>>().add(material);
         world.spawn((
             Name::new(format!(
                 "{} decal {}",
@@ -408,8 +449,21 @@ fn setup_renderer(world: &mut World) {
     }
     let camera = FirstPersonCamera::new(&pose, prepared.center, prepared.radius);
     let far = camera.far(pose.translation);
+    let sky = legacy::load_sky(&prepared.content).expect("default sky faces ship in content/sky");
+    let sky = world.resource_mut::<Assets<Image>>().add(sky);
     world.spawn((
         Camera3d::default(),
+        // The original has no tonemapping or HDR: colors are written as computed.
+        Tonemapping::None,
+        DebandDither::Disabled,
+        // Skybox brightness 1000 cd/m^2 is 1.0 at Bevy's default exposure.
+        Skybox {
+            image: Some(sky),
+            brightness: 1000.0
+                * (shading.sky_ambient[0] + shading.sky_ambient[1] + shading.sky_ambient[2])
+                / 3.0,
+            ..default()
+        },
         camera,
         Projection::Perspective(PerspectiveProjection {
             fov: initial.fov,
@@ -420,14 +474,27 @@ fn setup_renderer(world: &mut World) {
         pose,
     ));
     walk::spawn_walker(world);
+    // Only the direction and shadow map are used; legacy colors come from `LegacyMaterial`.
     world.spawn((
         DirectionalLight {
             shadow_maps_enabled: true,
-            illuminance: 12_000.0,
+            illuminance: 10_000.0,
             ..default()
         },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.9, -0.5, 0.0)),
+        CascadeShadowConfigBuilder {
+            // Legacy shadow map radius is 51-102 studs around the camera focus.
+            maximum_distance: 150.0,
+            first_cascade_far_bound: 30.0,
+            ..default()
+        }
+        .build(),
+        Transform::IDENTITY.looking_to(-shading.direction_to_light, Vec3::Y),
     ));
+    world.insert_resource(ClearColor(Color::srgb(
+        shading.sky_ambient[0],
+        shading.sky_ambient[1],
+        shading.sky_ambient[2],
+    )));
     println!(
         "Click to capture the mouse. Walking: WASD/arrows, Space jumps. F toggles legacy fly mode (Q/E down/up, Shift slow). Esc releases."
     );
@@ -442,7 +509,7 @@ mod tests {
         let content = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../content");
         let model = Model::load(content.join("other/character.rbxm")).unwrap();
         let scene = SceneSnapshot::from_model(&model, &content).unwrap();
-        let prepared = prepare(scene, &content).unwrap();
+        let prepared = prepare(scene, Lighting::default(), &content).unwrap();
         assert!((prepared.center.z - 25.5).abs() < 0.001);
         let head = prepared
             .snapshot

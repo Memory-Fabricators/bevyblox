@@ -6,6 +6,7 @@ use std::{
 use bevy::prelude::{Mat3, Quat, Resource, Vec3};
 
 pub mod decal;
+pub mod lighting;
 pub mod mesh;
 pub mod texture;
 
@@ -80,6 +81,14 @@ pub struct PartSnapshot {
     pub decals_ignore_size: bool,
     /// `CanCollide` (default true); physics ignores parts where it is false.
     pub can_collide: bool,
+    /// Serialized `Material` token (App/include/util/PartMaterial.h); 256 is Plastic.
+    pub material: u32,
+    /// Surface type per face in NormalId order (right, top, back, left, bottom, front); see
+    /// App/include/util/SurfaceType.h. Defaults are studs on top and an inlet underneath.
+    pub surfaces: [u8; 6],
+    /// No SpecialMesh/BlockMesh/CylinderMesh child: studs and outlines apply (legacy
+    /// `ignoreMaterialsStuds` is false).
+    pub plain_shape: bool,
 }
 
 #[derive(Resource, Debug)]
@@ -288,6 +297,9 @@ impl SceneSnapshot {
                     None => true,
                     _ => return Err(error(instance, "CanCollide must be a bool")),
                 },
+                material: material_token(instance)?,
+                surfaces: surface_types(instance)?,
+                plain_shape: part_mesh.is_none(),
                 texture,
                 decals,
                 decals_ignore_size: part_mesh
@@ -401,6 +413,35 @@ fn resolve_texture(
         }
         ContentRef::Local(path) => Some(path),
     })
+}
+fn material_token(instance: &ModelInstance) -> ModelResult<u32> {
+    let value = number(instance, &["Material"], 256.0)?;
+    if value.fract() != 0.0 || !(0.0..=65535.0).contains(&value) {
+        return Err(error(instance, "invalid Material token"));
+    }
+    Ok(value as u32)
+}
+
+fn surface_types(instance: &ModelInstance) -> ModelResult<[u8; 6]> {
+    // Property names in NormalId order; PartInstance.cpp:439 defaults.
+    const NAMES: [&str; 6] = [
+        "RightSurface",
+        "TopSurface",
+        "BackSurface",
+        "LeftSurface",
+        "BottomSurface",
+        "FrontSurface",
+    ];
+    const DEFAULTS: [u8; 6] = [0, 3, 0, 0, 4, 0];
+    let mut out = DEFAULTS;
+    for (slot, name) in out.iter_mut().zip(NAMES) {
+        let value = number(instance, &[name], f64::from(*slot))?;
+        if value.fract() != 0.0 || !(0.0..=10.0).contains(&value) {
+            return Err(error(instance, &format!("invalid {name}")));
+        }
+        *slot = value as u8;
+    }
+    Ok(out)
 }
 fn matrix(rows: [[f32; 3]; 3]) -> Mat3 {
     Mat3::from_cols(

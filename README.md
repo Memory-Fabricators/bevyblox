@@ -43,6 +43,17 @@ A graphical desktop and GPU are required for the viewer. Arrow keys orbit the mo
 
 This is a static model viewer, not a replacement Roblox game engine. Embedded scripts are decoded/countable but **not executed**; no Luau runtime is linked yet (`mlua` was removed until script porting begins). There is no physics, animation, replication, GUI, remote asset fetching, or Roblox scripting API. Terrain, effects, local lights, CSG/MeshPart/TrussPart geometry, and unsupported mesh variants are omitted and reported where recognized. Legacy surface textures, cylinder bevel/bulge controls, and exact legacy material/shader behavior are not reproduced; Bevy supplies the viewer camera, directional light, and PBR shading.
 
+## Legacy look
+
+Parts are drawn by `blox-game/src/legacy.wesl`, a port of the legacy forward shader (`shaders/source/default.hlsl`, `plastic.hlsl`, `common.h`), not Bevy's PBR. Lighting is the original model: `(Ambient + (saturate(N.L)*Lamp0 + saturate(-N.L)*Lamp1) * shadow) * albedo` plus a Blinn specular term, in non-linear colour space with no tonemapping (`Tonemapping::None`; only the final value is converted for Bevy's sRGB framebuffer).
+
+- **Lighting service** (`blox-scene/src/lighting.rs`, from `Lighting.cpp`, `LightingParameters.cpp`, `RenderView::presetLighting`): `Ambient`, `Brightness`, `ColorShift_Top/Bottom`, `TimeOfDay`, `GeographicLatitude`, `FogColor/Start/End` and `Outlines` are read from the place. The sun direction and colour come from the original time-of-day splines; the key light is `lightColor*0.9*Brightness`, the fill light is 0.4 of that from the opposite side. Shadows come from Bevy's directional shadow map but attenuate only the key light, by at most 75%, as `common.h` does.
+- **Edge outlines:** every block face darkens along its edges by the `default.hlsl` formula, fading with distance (shading distance 300 studs).
+- **Studs and inlets** on Plastic block parts, per face `TopSurface`/`BottomSurface`/etc. The original atlas (`studs.dds`, `plastic/*.dds`) is not in this repository, so the relief is drawn procedurally; weld, glue, universal and motor surfaces are drawn flat.
+- **Part materials:** specular intensity/power per `Material` (table from `MaterialGenerator.cpp`); Neon is unlit; reflectance only thins Plastic transparency.
+- **Sky:** a skybox from `content/sky/null_plainsky512_*.jpg`, tinted by the time-of-day sky colour. The place's own `Sky` faces are remote asset ids and are not fetched. Sun, moon and star sprites are not drawn.
+- **Not ported:** the material texture sets (wood, brick, grass, ...; not in the repository, so those materials render flat), normal maps, the light grid and point lights, environment reflections, per-part colour/normal jitter, and live `TimeOfDay` changes (lighting is fixed at load).
+
 ## Camera and movement
 
 The viewer starts at the place's saved `Workspace.CurrentCamera` pose and FOV (70 degrees by default, as `Camera.cpp`); there is no map-fitting orbit camera. Click to capture the mouse, Esc releases it.

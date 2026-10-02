@@ -40,7 +40,8 @@ pub fn decode(bytes: &[u8], extension: &str, wrap: Wrap) -> Result<Image, String
         bytes,
         ImageType::Extension(&extension.to_ascii_lowercase()),
         CompressedImageFormats::NONE,
-        true,
+        // The legacy shader samples and blends raw (gamma-space) values; see blox-game's legacy.wesl.
+        false,
         ImageSampler::Descriptor(ImageSamplerDescriptor {
             address_mode_u: address_mode,
             address_mode_v: address_mode,
