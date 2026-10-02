@@ -5,8 +5,10 @@ use std::{
 
 use bevy::prelude::{Mat3, Quat, Resource, Vec3};
 
+pub mod dds;
 pub mod decal;
 pub mod lighting;
+pub mod material;
 pub mod mesh;
 pub mod texture;
 

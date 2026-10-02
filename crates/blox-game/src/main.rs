@@ -31,6 +31,37 @@ struct PreparedScene {
     colliders: Vec<Option<bevy_rapier3d::prelude::Collider>>,
     lighting: Lighting,
     content: PathBuf,
+    /// `PlatformContent/pc/textures`: stud atlas and part material maps.
+    platform_textures: PathBuf,
+}
+
+/// Decodes each `PlatformContent` texture at most once. Missing or corrupt files are reported
+/// once and the part falls back to a flat color.
+struct PlatformTextures {
+    root: PathBuf,
+    cache: HashMap<String, Option<Handle<Image>>>,
+}
+
+impl PlatformTextures {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            cache: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, name: &str, world: &mut World) -> Option<Handle<Image>> {
+        self.cache
+            .entry(name.to_owned())
+            .or_insert_with(|| match blox_scene::dds::load(&self.root.join(name)) {
+                Ok(image) => Some(world.resource_mut::<Assets<Image>>().add(image)),
+                Err(error) => {
+                    eprintln!("Not rendered: {error}");
+                    None
+                }
+            })
+            .clone()
+    }
 }
 
 /// A decal/texture drawn over its part with the part's transform.
@@ -295,6 +326,7 @@ fn prepare(
         colliders,
         lighting,
         content: content.to_path_buf(),
+        platform_textures: content.join("../PlatformContent/pc/textures"),
     })
 }
 
@@ -326,6 +358,7 @@ fn setup_renderer(world: &mut World) {
     } = prepared.surfaces;
     let lighting = prepared.lighting;
     let shading = lighting.shading();
+    let mut textures = PlatformTextures::new(prepared.platform_textures);
     // One material per distinct appearance so Bevy can batch the thousands of parts in a place.
     let mut materials: HashMap<Vec<u32>, Handle<LegacyMaterial>> = HashMap::new();
     for (((part, mesh_index), transform), part_image) in prepared
@@ -336,20 +369,84 @@ fn setup_renderer(world: &mut World) {
         .zip(&prepared.transforms)
         .zip(part_images)
     {
-        let plastic = part.material == 256;
         let block = part.geometry == Geometry::Block;
-        let mut flags = 0;
-        if plastic && block && part.plain_shape {
-            flags |= legacy::FLAG_STUDS;
-        }
+        let surface = blox_scene::material::surface_material(part.material)
+            .filter(|_| block && part_image.is_none());
+        let mut appearance = Appearance {
+            // A textured mesh takes its color from the texture, not the part color.
+            color: if part_image.is_some() {
+                [1.0; 3]
+            } else {
+                part.color_srgb
+            },
+            alpha: 1.0,
+            specular: legacy::specular(part.material),
+            flags: 0,
+            surfaces: part.surfaces,
+            texture: part_image.map(|i| images[i].clone()),
+            normal: None,
+            specular_map: None,
+            tex: [1.0, 1.0, 1.0, 0.0],
+        };
         if lighting.outlines && block {
-            flags |= legacy::FLAG_OUTLINE;
+            appearance.flags |= legacy::FLAG_OUTLINE;
         }
         if part_image.is_some() {
-            flags |= legacy::FLAG_TEXTURE;
+            appearance.flags |= legacy::FLAG_TEXTURE;
         }
-        if part.material == 288 {
-            flags |= legacy::FLAG_UNLIT;
+        if part.material == blox_scene::material::NEON {
+            appearance.flags |= legacy::FLAG_UNLIT;
+        }
+        let plastic = part.material == blox_scene::material::PLASTIC;
+        if plastic && block && part.plain_shape && part_image.is_none() {
+            // plastic.hlsl: the stud atlas and its normal map, indexed by surface type.
+            if let Some(atlas) = textures.get("plastic/diffuse.dds", world) {
+                appearance.texture = Some(atlas);
+                appearance.normal = textures.get("plastic/normal.dds", world);
+                appearance.flags |= legacy::FLAG_STUDS;
+                if appearance.normal.is_some() {
+                    appearance.flags |= legacy::FLAG_NORMAL;
+                }
+            }
+        } else if let Some(material) = surface {
+            let folder = material.folder;
+            let diffuse = if material.diffuse_const {
+                Some(None)
+            } else {
+                textures
+                    .get(&format!("{folder}/diffuse.dds"), world)
+                    .map(Some)
+            };
+            if let Some(diffuse) = diffuse {
+                appearance.texture = diffuse;
+                appearance.flags |= legacy::FLAG_MATERIAL;
+                appearance.tex = [
+                    material.tiling,
+                    material.specular_scale,
+                    material.gloss_scale,
+                    material.normal_shadow,
+                ];
+                if material.blend_color {
+                    appearance.flags |= legacy::FLAG_BLEND;
+                }
+                if material.diffuse_const {
+                    appearance.flags |= legacy::FLAG_DIFFUSE_CONST;
+                }
+                // Brick and WoodPlanks offset by whole studs (getSurfaceOffset).
+                if matches!(part.material, 848 | 528) {
+                    appearance.flags |= legacy::FLAG_WHOLE_STUD_OFFSET;
+                }
+                if !material.normal_const {
+                    appearance.normal = textures.get(&format!("{folder}/normal.dds"), world);
+                    if appearance.normal.is_some() {
+                        appearance.flags |= legacy::FLAG_NORMAL;
+                    }
+                }
+                appearance.specular_map = textures.get(&format!("{folder}/specular.dds"), world);
+                if appearance.specular_map.is_some() {
+                    appearance.flags |= legacy::FLAG_SPECULAR;
+                }
+            }
         }
         // GeometryGenerator.cpp::getPartTransparency: reflectance only thins Plastic.
         let transparency = if plastic {
@@ -357,18 +454,14 @@ fn setup_renderer(world: &mut World) {
         } else {
             part.transparency
         };
-        let appearance = Appearance {
-            // A textured mesh takes its color from the texture, not the part color.
-            color: if part_image.is_some() {
-                [1.0; 3]
-            } else {
-                part.color_srgb
-            },
-            alpha: 1.0 - (transparency.clamp(0.0, 1.0) * 255.0).floor() / 255.0,
-            specular: legacy::specular(part.material),
-            flags,
-            surfaces: part.surfaces,
-            texture: part_image.map(|i| images[i].clone()),
+        appearance.alpha = 1.0 - (transparency.clamp(0.0, 1.0) * 255.0).floor() / 255.0;
+        let handle_id = |h: &Option<Handle<Image>>| {
+            h.as_ref().map_or(0, |h| {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                h.id().hash(&mut hasher);
+                hasher.finish() as u32
+            })
         };
         let key = vec![
             appearance.color[0].to_bits(),
@@ -377,11 +470,14 @@ fn setup_renderer(world: &mut World) {
             appearance.alpha.to_bits(),
             appearance.specular.0.to_bits(),
             appearance.specular.1.to_bits(),
-            flags,
+            appearance.flags,
             part.surfaces
                 .iter()
                 .fold(0, |bits, s| bits << 4 | u32::from(*s)),
-            part_image.map_or(u32::MAX, |i| i as u32),
+            handle_id(&appearance.texture),
+            handle_id(&appearance.normal),
+            handle_id(&appearance.specular_map),
+            appearance.tex[0].to_bits(),
         ];
         let material = materials
             .entry(key)
@@ -424,6 +520,9 @@ fn setup_renderer(world: &mut World) {
                 flags: legacy::FLAG_TEXTURE,
                 surfaces: [0; 6],
                 texture: Some(images[draw.image].clone()),
+                normal: None,
+                specular_map: None,
+                tex: [1.0, 1.0, 1.0, 0.0],
             },
         );
         material.alpha_mode = AlphaMode::Blend;

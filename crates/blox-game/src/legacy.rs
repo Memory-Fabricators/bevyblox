@@ -27,10 +27,17 @@ impl Plugin for LegacyRenderPlugin {
 /// Distance at which edge outlines fade out (`shadingDistance` of the top quality tiers).
 const SHADING_DISTANCE: f32 = 300.0;
 
+// Keep in sync with the flags in legacy.wesl.
 pub const FLAG_STUDS: u32 = 1;
 pub const FLAG_OUTLINE: u32 = 2;
 pub const FLAG_TEXTURE: u32 = 4;
 pub const FLAG_UNLIT: u32 = 8;
+pub const FLAG_MATERIAL: u32 = 16;
+pub const FLAG_BLEND: u32 = 32;
+pub const FLAG_DIFFUSE_CONST: u32 = 64;
+pub const FLAG_NORMAL: u32 = 128;
+pub const FLAG_SPECULAR: u32 = 256;
+pub const FLAG_WHOLE_STUD_OFFSET: u32 = 512;
 
 #[derive(Clone, Debug, PartialEq, bevy::render::render_resource::ShaderType)]
 pub struct LegacyUniform {
@@ -41,6 +48,7 @@ pub struct LegacyUniform {
     fog_color: Vec4,
     fog: Vec4,
     spec: Vec4,
+    tex: Vec4,
     packed: UVec4,
 }
 
@@ -51,6 +59,12 @@ pub struct LegacyMaterial {
     #[texture(1)]
     #[sampler(2)]
     pub texture: Option<Handle<Image>>,
+    #[texture(3)]
+    #[sampler(4)]
+    pub normal: Option<Handle<Image>>,
+    #[texture(5)]
+    #[sampler(6)]
+    pub specular: Option<Handle<Image>>,
     pub alpha_mode: AlphaMode,
     /// Decals use a depth bias so they win against the part they sit on.
     pub depth_bias: f32,
@@ -82,6 +96,10 @@ pub struct Appearance {
     /// SurfaceType per face in NormalId order.
     pub surfaces: [u8; 6],
     pub texture: Option<Handle<Image>>,
+    pub normal: Option<Handle<Image>>,
+    pub specular_map: Option<Handle<Image>>,
+    /// Texture repeats per stud, specular scale, gloss scale, normal shadow scale.
+    pub tex: [f32; 4],
 }
 
 impl LegacyMaterial {
@@ -108,9 +126,12 @@ impl LegacyMaterial {
                 fog_color: rgb(lighting.fog_color),
                 fog: Vec4::new(lighting.fog_start, lighting.fog_end, SHADING_DISTANCE, 0.0),
                 spec: Vec4::new(appearance.specular.0, appearance.specular.1, 0.0, 0.0),
+                tex: Vec4::from_array(appearance.tex),
                 packed: UVec4::new(surfaces, appearance.flags, 0, 0),
             },
             texture: appearance.texture.clone(),
+            normal: appearance.normal.clone(),
+            specular: appearance.specular_map.clone(),
             alpha_mode: if appearance.alpha < 1.0 {
                 AlphaMode::Blend
             } else {
