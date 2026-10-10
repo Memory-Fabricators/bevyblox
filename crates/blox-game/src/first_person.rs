@@ -299,7 +299,7 @@ fn instance_pose(instance: &ModelInstance) -> ModelResult<Option<Transform>> {
     };
     let Property::CFrame {
         position,
-        rotation: rows,
+        rotation: matrix,
     } = property
     else {
         return Err(ModelError(format!(
@@ -307,12 +307,8 @@ fn instance_pose(instance: &ModelInstance) -> ModelResult<Option<Transform>> {
             instance.class
         )));
     };
-    let matrix = Mat3::from_cols(
-        Vec3::new(rows[0][0], rows[1][0], rows[2][0]),
-        Vec3::new(rows[0][1], rows[1][1], rows[2][1]),
-        Vec3::new(rows[0][2], rows[1][2], rows[2][2]),
-    );
-    let position = Vec3::from_array(*position);
+    let position = *position;
+    let matrix = *matrix;
     if !position.is_finite() || !matrix.is_finite() || (matrix.determinant() - 1.0).abs() > 0.02 {
         return Err(ModelError(format!(
             "{} has an invalid camera/spawn CFrame",
@@ -392,8 +388,12 @@ mod tests {
     #[test]
     fn workspace_current_camera_wins_and_legacy_pose_is_not_reframed() {
         let frame = Property::CFrame {
-            position: [123.0, 4.0, -567.0],
-            rotation: [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]],
+            position: Vec3::new(123.0, 4.0, -567.0),
+            rotation: Mat3::from_cols(
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+            ),
         };
         let model = Model {
             instances: vec![

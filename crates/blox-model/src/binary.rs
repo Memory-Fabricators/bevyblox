@@ -1,6 +1,7 @@
 //! Version-zero format from App/v8xml/SerializerBinary.cpp. All byte readers
 //! are bounded; numeric vectors are views of the four interleaved byte planes.
 use super::{Model, ModelError, ModelInstance, ModelResult, Property};
+use glam::{Mat3, Vec2, Vec3};
 use std::{borrow::Cow, collections::HashMap};
 
 fn error(message: impl Into<String>) -> ModelError {
@@ -106,87 +107,7 @@ fn reserve<T>(values: &mut Vec<T>, count: usize) -> ModelResult<()> {
         .map_err(|_| error("Binary model allocation is too large"))
 }
 
-// Native LZ4 block decoding, following App/lz4/lz4_decoder.h (included by
-// App/lz4/lz4.c). No prefix dictionary, frame wrapper, or external compressor.
-fn lz4(bytes: &[u8], size: usize) -> ModelResult<Vec<u8>> {
-    if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) || bytes.starts_with(&[0x04, 0x22, 0x4d, 0x18])
-    {
-        return Err(error(
-            "Unsupported binary model compression (expected a raw LZ4 block)",
-        ));
-    }
-    // Each extension byte can account for at most 255 output bytes. Check the
-    // advertised size before reserving, rather than trusting a chunk header.
-    let bound = bytes
-        .len()
-        .checked_mul(255)
-        .and_then(|n| n.checked_add(16))
-        .ok_or_else(|| error("LZ4 size overflow"))?;
-    if size > bound {
-        return Err(error("Impossible LZ4 decompressed size"));
-    }
-    let mut input = Reader::new(bytes);
-    let mut out = Vec::new();
-    reserve(&mut out, size)?;
-    let mut matched = false;
-    loop {
-        let token = input.byte()?;
-        let literals = lz4_length(&mut input, (token >> 4) as usize)?;
-        if literals > size - out.len() {
-            return Err(error("LZ4 literal run exceeds output size"));
-        }
-        out.extend_from_slice(input.take(literals)?);
-        if input.remaining() == 0 {
-            if out.len() != size || (matched && literals < 5) {
-                return Err(error("Malformed LZ4 final literal run"));
-            }
-            return Ok(out);
-        }
-        // The reference requires the last match to begin at least 12 bytes
-        // before the end and the last five output bytes to be literals.
-        if size - out.len() < 12 {
-            return Err(error("Malformed LZ4 match near end of block"));
-        }
-        let offset = input.u16()? as usize;
-        if offset == 0 || offset > out.len() {
-            return Err(error("Invalid LZ4 match offset"));
-        }
-        let mut length = lz4_length(&mut input, (token & 15) as usize)?
-            .checked_add(4)
-            .ok_or_else(|| error("LZ4 match size overflow"))?;
-        if length > size - out.len() - 5 {
-            return Err(error("LZ4 match exceeds output size"));
-        }
-        let start = out.len() - offset;
-        // Grow the already decoded pattern, including overlapping matches.
-        // Each copy reads only initialized bytes, and the reserved output
-        // capacity prevents reallocating during expansion.
-        while length != 0 {
-            let count = length.min(out.len() - start);
-            out.extend_from_within(start..start + count);
-            length -= count;
-        }
-        matched = true;
-    }
-}
-
-fn lz4_length(input: &mut Reader<'_>, initial: usize) -> ModelResult<usize> {
-    let mut length = initial;
-    if initial == 15 {
-        loop {
-            let next = input.byte()? as usize;
-            length = length
-                .checked_add(next)
-                .ok_or_else(|| error("LZ4 run length overflow"))?;
-            if next != 255 {
-                break;
-            }
-        }
-    }
-    Ok(length)
-}
-
-fn orientation(encoded: u8) -> ModelResult<[[f32; 3]; 3]> {
+fn orientation(encoded: u8) -> ModelResult<Mat3> {
     // Math::idToMatrix3 uses NormalId order +X,+Y,+Z,-X,-Y,-Z
     // for the first two columns and their cross product for the third.
     let id = encoded
@@ -197,37 +118,34 @@ fn orientation(encoded: u8) -> ModelResult<[[f32; 3]; 3]> {
     if x >= 6 || x % 3 == y % 3 {
         return Err(error("Invalid CFrame orientation ID"));
     }
-    const NORMALS: [[f32; 3]; 6] = [
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-        [-1.0, 0.0, 0.0],
-        [0.0, -1.0, 0.0],
-        [0.0, 0.0, -1.0],
+    const NORMALS: [Vec3; 6] = [
+        Vec3::X,
+        Vec3::Y,
+        Vec3::Z,
+        Vec3::NEG_X,
+        Vec3::NEG_Y,
+        Vec3::NEG_Z,
     ];
     let a = NORMALS[x];
     let b = NORMALS[y];
-    let c = [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ];
-    Ok([[a[0], b[0], c[0]], [a[1], b[1], c[1]], [a[2], b[2], c[2]]])
+    Ok(Mat3::from_cols(a, b, a.cross(b)))
 }
 
-fn rotation(input: &mut Reader<'_>, quaternion: bool) -> ModelResult<[[f32; 3]; 3]> {
+fn rotation(input: &mut Reader<'_>, quaternion: bool) -> ModelResult<Mat3> {
     let encoded = input.byte()?;
     if encoded != 0 {
         return orientation(encoded);
     }
     if !quaternion {
-        let mut matrix = [[0.0; 3]; 3];
-        for row in &mut matrix {
-            for value in row {
-                *value = input.f32()?;
-            }
+        let mut matrix = [0.0; 9];
+        for value in &mut matrix {
+            *value = input.f32()?;
         }
-        return Ok(matrix);
+        // Stored row-major: R00 R01 R02 R10 R11 R12 R20 R21 R22.
+        return Ok(Mat3::from_cols_array(&[
+            matrix[0], matrix[3], matrix[6], matrix[1], matrix[4], matrix[7], matrix[2], matrix[5],
+            matrix[8],
+        ]));
     }
     // RBX::Quaternion stores x,y,z,w; conversion intentionally does not
     // renormalize, matching App/util/Quaternion.cpp::toRotationMatrix.
@@ -241,11 +159,11 @@ fn rotation(input: &mut Reader<'_>, quaternion: bool) -> ModelResult<[[f32; 3]; 
     let (xx, xy, xz) = (x * xc, x * yc, x * zc);
     let (wx, wy, wz) = (w * xc, w * yc, w * zc);
     let (yy, yz, zz) = (y * yc, y * zc, z * zc);
-    Ok([
-        [1.0 - (yy + zz), xy - wz, xz + wy],
-        [xy + wz, 1.0 - (xx + zz), yz - wx],
-        [xz - wy, yz + wx, 1.0 - (xx + yy)],
-    ])
+    Ok(Mat3::from_cols(
+        Vec3::new(1.0 - (yy + zz), xy + wz, xz - wy),
+        Vec3::new(xy - wz, 1.0 - (xx + zz), yz + wx),
+        Vec3::new(xz + wy, yz - wx, 1.0 - (xx + yy)),
+    ))
 }
 
 fn type_name(format: u8) -> String {
@@ -286,8 +204,7 @@ fn type_name(format: u8) -> String {
 fn rendering_property(name: &str) -> bool {
     matches!(
         name,
-        "Name"
-            | "CFrame"
+        "CFrame"
             | "CoordinateFrame"
             | "Size"
             | "size"
@@ -312,6 +229,8 @@ fn set_property(instance: &mut ModelInstance, name: &str, value: Property) -> Mo
     if name == "Name" {
         match &value {
             Property::Text(text) => instance.name.clone_from(text),
+            // Roblox names are raw bytes; a non-UTF-8 name keeps its bytes and is shown lossily.
+            Property::Binary(bytes) => instance.name = String::from_utf8_lossy(bytes).into_owned(),
             _ => return Err(error("Instance Name is not a text string")),
         }
     }
@@ -338,10 +257,12 @@ fn properties(
                 let bytes = input.string_bytes()?;
                 let value = match std::str::from_utf8(bytes) {
                     Ok(text) => Property::Text(text.to_owned()),
+                    // Valid UTF-8 rendering properties must decode; the rest are binary blobs
+                    // (terrain grids, CSG meshes) that are not text at all.
                     Err(_) if rendering_property(name) => {
                         return Err(error(format!("Invalid UTF-8 in {name}")));
                     }
-                    Err(_) => Property::Other("BinaryString".to_owned()),
+                    Err(_) => Property::Binary(bytes.to_vec()),
                 };
                 set_property(&mut model.instances[index], name, value)?;
             }
@@ -396,7 +317,7 @@ fn properties(
             let y = input.words(count)?;
             let z = input.words(count)?;
             for (i, &index) in indices.iter().enumerate() {
-                let v = [x.float(i), y.float(i), z.float(i)];
+                let v = Vec3::new(x.float(i), y.float(i), z.float(i));
                 let value = if format == 12 {
                     Property::Color3(v)
                 } else {
@@ -421,7 +342,7 @@ fn properties(
             let z = input.words(count)?;
             for (i, (&index, rotation)) in indices.iter().zip(rotations).enumerate() {
                 let value = Property::CFrame {
-                    position: [x.float(i), y.float(i), z.float(i)],
+                    position: Vec3::new(x.float(i), y.float(i), z.float(i)),
                     rotation,
                 };
                 set_property(&mut model.instances[index], name, value)?;
@@ -432,23 +353,198 @@ fn properties(
                 return Err(error("Truncated Vector3int16 property vector"));
             }
             for &index in indices {
-                let v = [
+                let v = Vec3::new(
                     input.u16()? as i16 as f32,
                     input.u16()? as i16 as f32,
                     input.u16()? as i16 as f32,
-                ];
+                );
                 set_property(&mut model.instances[index], name, Property::Vector3(v))?;
             }
         }
-        _ => {
-            let kind = type_name(format);
-            if rendering_property(name) {
-                return Err(error(format!(
-                    "Unsupported binary property type {kind} for {name}"
-                )));
+        // UDim and UDim2 carry float scales and zigzag integer offsets. GUI
+        // properties such as `Size` use these, so they cannot be treated as
+        // Part-valued `Vector3` properties (SerializerBinary.cpp:718-745).
+        6 => {
+            let scales = input.words(count)?;
+            let offsets = input.words(count)?;
+            for (i, &index) in indices.iter().enumerate() {
+                set_property(
+                    &mut model.instances[index],
+                    name,
+                    Property::Udim {
+                        scale: scales.float(i),
+                        offset: offsets.int(i),
+                    },
+                )?;
             }
-            // PROP chunks are independently framed: an unrepresented type
-            // can be skipped without attempting to infer its value layout.
+        }
+        7 => {
+            let x_scales = input.words(count)?;
+            let y_scales = input.words(count)?;
+            let x_offsets = input.words(count)?;
+            let y_offsets = input.words(count)?;
+            for (i, &index) in indices.iter().enumerate() {
+                set_property(
+                    &mut model.instances[index],
+                    name,
+                    Property::Udim2 {
+                        x_scale: x_scales.float(i),
+                        x_offset: x_offsets.int(i),
+                        y_scale: y_scales.float(i),
+                        y_offset: y_offsets.int(i),
+                    },
+                )?;
+            }
+        }
+        8 => {
+            if count > input.remaining() / 24 {
+                return Err(error("Truncated Ray property vector"));
+            }
+            for &index in indices {
+                let origin = Vec3::new(input.f32()?, input.f32()?, input.f32()?);
+                let direction = Vec3::new(input.f32()?, input.f32()?, input.f32()?);
+                set_property(
+                    &mut model.instances[index],
+                    name,
+                    Property::Ray { origin, direction },
+                )?;
+            }
+        }
+        13 => {
+            let x = input.words(count)?;
+            let y = input.words(count)?;
+            for (i, &index) in indices.iter().enumerate() {
+                set_property(
+                    &mut model.instances[index],
+                    name,
+                    Property::Vector2(Vec2::new(x.float(i), y.float(i))),
+                )?;
+            }
+        }
+        15 => {
+            if count > input.remaining() / 4 {
+                return Err(error("Truncated Vector2int16 property vector"));
+            }
+            for &index in indices {
+                let x = input.u16()? as i16 as f32;
+                let y = input.u16()? as i16 as f32;
+                set_property(
+                    &mut model.instances[index],
+                    name,
+                    Property::Vector2(Vec2::new(x, y)),
+                )?;
+            }
+        }
+        // Sequences and physical properties are variable-length and interleaved
+        // per instance, not per component, so each entry is fully framed.
+        21 => {
+            if count > input.remaining() / 4 {
+                return Err(error("Truncated NumberSequence property vector"));
+            }
+            for &index in indices {
+                let keys = input.u32()? as usize;
+                if keys > input.remaining() / 12 {
+                    return Err(error("Truncated NumberSequence keypoints"));
+                }
+                let mut points = Vec::new();
+                reserve(&mut points, keys)?;
+                for _ in 0..keys {
+                    points.push(Vec3::new(input.f32()?, input.f32()?, input.f32()?));
+                }
+                set_property(
+                    &mut model.instances[index],
+                    name,
+                    Property::NumberSequence(points),
+                )?;
+            }
+        }
+        22 => {
+            if count > input.remaining() / 4 {
+                return Err(error("Truncated ColorSequence property vector"));
+            }
+            for &index in indices {
+                let keys = input.u32()? as usize;
+                // ColorSequenceKeypoint is time, Color3 and envelope: 20 bytes.
+                if keys > input.remaining() / 20 {
+                    return Err(error("Truncated ColorSequence keypoints"));
+                }
+                let mut points = Vec::new();
+                reserve(&mut points, keys)?;
+                for _ in 0..keys {
+                    points.push([
+                        input.f32()?,
+                        input.f32()?,
+                        input.f32()?,
+                        input.f32()?,
+                        input.f32()?,
+                    ]);
+                }
+                set_property(
+                    &mut model.instances[index],
+                    name,
+                    Property::ColorSequence(points),
+                )?;
+            }
+        }
+        23 => {
+            if count > input.remaining() / 8 {
+                return Err(error("Truncated NumberRange property vector"));
+            }
+            for &index in indices {
+                let range = Vec2::new(input.f32()?, input.f32()?);
+                set_property(
+                    &mut model.instances[index],
+                    name,
+                    Property::NumberRange(range),
+                )?;
+            }
+        }
+        24 => {
+            // Rect2D has no consumer in the viewer; consume its four planes so
+            // the chunk stays aligned, and record it as opaque.
+            for _ in 0..4 {
+                let _ = input.words(count)?;
+            }
+            for &index in indices {
+                set_property(
+                    &mut model.instances[index],
+                    name,
+                    Property::Other(type_name(24)),
+                )?;
+            }
+        }
+        25 => {
+            if count > input.remaining() {
+                return Err(error("Truncated PhysicalProperties property vector"));
+            }
+            for &index in indices {
+                let custom = match input.byte()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(error("Invalid binary PhysicalProperties flag")),
+                };
+                let mut values = [0.0; 5];
+                if custom {
+                    if input.remaining() < 20 {
+                        return Err(error("Truncated PhysicalProperties values"));
+                    }
+                    for value in &mut values {
+                        *value = input.f32()?;
+                    }
+                }
+                set_property(
+                    &mut model.instances[index],
+                    name,
+                    Property::PhysicalProperties { custom, values },
+                )?;
+            }
+        }
+        _ => {
+            // PROP chunks are independently framed: an unrepresented type can
+            // be skipped without attempting to infer its value layout. Types
+            // named like rendering properties are still stored opaquely, since
+            // names such as `Size` and `Color` also exist on non-part classes.
+            let kind = type_name(format);
             for &index in indices {
                 set_property(
                     &mut model.instances[index],
@@ -503,7 +599,7 @@ pub(super) fn decode(bytes: &[u8]) -> ModelResult<Model> {
         let data = if compressed == 0 {
             Cow::Borrowed(stored)
         } else {
-            Cow::Owned(lz4(stored, size)?)
+            Cow::Owned(lz4rip::decompress(stored, size).unwrap())
         };
         let mut chunk = Reader::new(&data);
         match tag {
@@ -795,36 +891,6 @@ mod tests {
     }
 
     #[test]
-    fn lz4_decodes_overlapping_matches_and_extensions() {
-        let encoded = [0x1f, b'a', 1, 0, 20, 0x50, b'b', b'c', b'd', b'e', b'f'];
-        let mut expected = vec![b'a'; 40];
-        expected.extend_from_slice(b"bcdef");
-        assert_eq!(lz4(&encoded, 45).unwrap(), expected);
-        let encoded = [
-            0x35, b'a', b'b', b'c', 3, 0, 0x50, b'v', b'w', b'x', b'y', b'z',
-        ];
-        assert_eq!(lz4(&encoded, 17).unwrap(), b"abcabcabcabcvwxyz");
-        assert_eq!(lz4(&[0], 0).unwrap(), b"");
-    }
-
-    #[test]
-    fn lz4_rejects_truncated_and_invalid_blocks() {
-        for (bytes, size) in [
-            (&[][..], 0),
-            (&[0xf0][..], 15),
-            (&[0x30, b'a'][..], 3),
-            (&[0x10, b'a', 0][..], 14),
-            (&[0x10, b'a', 0, 0][..], 14),
-            (&[0x10, b'a', 2, 0][..], 14),
-            (&[0x1f, b'a', 1, 0][..], 30),
-            (&[0x10, b'a'][..], 2),
-            (&[0][..], usize::MAX),
-        ] {
-            assert!(lz4(bytes, size).is_err(), "accepted {bytes:?}");
-        }
-    }
-
-    #[test]
     fn shuffled_numbers_preserve_signs_and_bit_patterns() {
         let int_values = [i32::MIN, -17, 0, 42, i32::MAX];
         let encoded = ints(&int_values);
@@ -876,20 +942,30 @@ mod tests {
             Property::Ref(Some("0".to_owned()))
         );
         assert_eq!(root.properties["Target"], Property::Ref(None));
-        assert_eq!(child.properties["size"], Property::Vector3([2.0, 3.0, 4.0]));
-        assert_eq!(child.properties["Color"], Property::Color3([1.0, 0.5, 0.0]));
+        assert_eq!(
+            child.properties["size"],
+            Property::Vector3(Vec3::new(2.0, 3.0, 4.0))
+        );
+        assert_eq!(
+            child.properties["Color"],
+            Property::Color3(Vec3::new(1.0, 0.5, 0.0))
+        );
         assert_eq!(
             child.properties["CFrame"],
             Property::CFrame {
-                position: [10.0, 20.0, 30.0],
-                rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                position: Vec3::new(10.0, 20.0, 30.0),
+                rotation: Mat3::IDENTITY,
             }
         );
         assert_eq!(
             root.properties["CFrame"],
             Property::CFrame {
-                position: [0.0, 1.0, 2.0],
-                rotation: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                position: Vec3::new(0.0, 1.0, 2.0),
+                rotation: Mat3::from_cols(
+                    Vec3::new(0.0, 1.0, 0.0),
+                    Vec3::new(-1.0, 0.0, 0.0),
+                    Vec3::new(0.0, 0.0, 1.0),
+                ),
             }
         );
     }
@@ -906,15 +982,24 @@ mod tests {
             encoded.extend_from_slice(&v.to_le_bytes());
         }
         let matrix = rotation(&mut Reader::new(&encoded), true).unwrap();
-        let expected = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let expected = Mat3::from_cols(
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        );
+        // Row-major equality: row r column c of the stored matrix.
         for row in 0..3 {
             for col in 0..3 {
-                assert!((matrix[row][col] - expected[row][col]).abs() < 1e-6);
+                assert!((matrix.col(col)[row] - expected.col(col)[row]).abs() < 1e-6);
             }
         }
         assert_eq!(
             orientation(7).unwrap(),
-            [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]]
+            Mat3::from_cols(
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, -1.0),
+            )
         );
         assert!(orientation(1).is_err());
         assert!(orientation(37).is_err());
@@ -994,11 +1079,160 @@ mod tests {
         assert_eq!(model.instances[0].properties["Count"], Property::Int(-123));
         assert_eq!(model.instances[1].properties["Count"], Property::Int(456));
 
+        // Unknown formats named like rendering properties (here a bogus CFrame
+        // encoding) are stored opaquely rather than aborting the load: `Size`,
+        // `Color` and `CFrame` are also legitimate non-Part property names.
         let mut unsupported = graph_model(&[0, 1], &[0, 1], &[-1, 0]);
         unsupported.truncate(unsupported.len() - 25);
         prop(&mut unsupported, "CFrame", 255, &[0xff, 0x00, 0x11]);
+        prop(&mut unsupported, "Count", 3, &ints(&[-123, 456]));
         chunk(&mut unsupported, b"END\0", b"</roblox>", false);
-        assert!(decode(&unsupported).is_err());
+        let model = decode(&unsupported).unwrap();
+        assert_eq!(
+            model.instances[0].properties["CFrame"],
+            Property::Other("Unknown(255)".to_owned())
+        );
+        assert_eq!(model.instances[0].properties["Count"], Property::Int(-123));
+    }
+
+    /// GUI classes serialize `Size`/`Position` as `UDim2` while parts use
+    /// `Vector3`; decoding the modern types must not abort a whole place load.
+    #[test]
+    fn gui_udim2_and_sibling_formats_decode_without_aborting() {
+        let mut bytes = graph_model(&[0, 1], &[0, 1], &[-1, 0]);
+        bytes.truncate(bytes.len() - 25);
+        let mut udim2 = Vec::new();
+        udim2.extend(floats(&[0.5, 1.0])); // x scale
+        udim2.extend(floats(&[0.25, 0.0])); // y scale
+        udim2.extend(ints(&[-4, 10])); // x offset
+        udim2.extend(ints(&[12, -8])); // y offset
+        prop(&mut bytes, "Size", 7, &udim2);
+        let mut udim = Vec::new();
+        udim.extend(floats(&[1.5, 2.5]));
+        udim.extend(ints(&[-3, 7]));
+        prop(&mut bytes, "Corner", 6, &udim);
+        let mut vector2 = Vec::new();
+        vector2.extend(floats(&[8.0, 16.0]));
+        vector2.extend(floats(&[-1.0, 2.0]));
+        prop(&mut bytes, "SizeOffset", 13, &vector2);
+        prop(&mut bytes, "Count", 3, &ints(&[5, 6]));
+        chunk(&mut bytes, b"END\0", b"</roblox>", false);
+
+        let model = decode(&bytes).unwrap();
+        assert_eq!(
+            model.instances[0].properties["Size"],
+            Property::Udim2 {
+                x_scale: 0.5,
+                x_offset: -4,
+                y_scale: 0.25,
+                y_offset: 12,
+            }
+        );
+        assert_eq!(
+            model.instances[1].properties["Size"],
+            Property::Udim2 {
+                x_scale: 1.0,
+                x_offset: 10,
+                y_scale: 0.0,
+                y_offset: -8,
+            }
+        );
+        assert_eq!(
+            model.instances[0].properties["Corner"],
+            Property::Udim {
+                scale: 1.5,
+                offset: -3
+            }
+        );
+        assert_eq!(
+            model.instances[1].properties["SizeOffset"],
+            Property::Vector2(Vec2::new(16.0, 2.0))
+        );
+        // Later properties in the same file must still decode.
+        assert_eq!(model.instances[0].properties["Count"], Property::Int(5));
+        assert_eq!(model.instances[1].properties["Count"], Property::Int(6));
+    }
+
+    #[test]
+    fn sequences_rays_ranges_and_physical_properties_decode() {
+        let mut bytes = graph_model(&[0], &[0], &[-1]);
+        bytes.truncate(bytes.len() - 25);
+        let mut ray = Vec::new();
+        for value in [0.0f32, 1.0, 2.0, 0.0, 0.0, -1.0] {
+            ray.extend_from_slice(&value.to_le_bytes());
+        }
+        prop(&mut bytes, "Target", 8, &ray);
+        let mut number_sequence = 2u32.to_le_bytes().to_vec();
+        for value in [0.0f32, 0.5, 0.0, 1.0, 2.0, 0.25] {
+            number_sequence.extend_from_slice(&value.to_le_bytes());
+        }
+        prop(&mut bytes, "Transparency", 21, &number_sequence);
+        let mut color_sequence = 1u32.to_le_bytes().to_vec();
+        for value in [0.5f32, 1.0, 0.0, 0.0, 0.25] {
+            color_sequence.extend_from_slice(&value.to_le_bytes());
+        }
+        prop(&mut bytes, "Color", 22, &color_sequence);
+        let mut range = Vec::new();
+        for value in [3.0f32, 9.0] {
+            range.extend_from_slice(&value.to_le_bytes());
+        }
+        prop(&mut bytes, "Range", 23, &range);
+        let mut physical = vec![1u8];
+        for value in [0.7f32, 0.3, 0.5, 1.0, 2.0] {
+            physical.extend_from_slice(&value.to_le_bytes());
+        }
+        prop(&mut bytes, "CustomPhysicalProperties", 25, &physical);
+        let mut rect = Vec::new();
+        for plane in [[0.0f32], [1.0], [2.0], [3.0]] {
+            rect.extend(floats(&plane));
+        }
+        prop(&mut bytes, "Inset", 24, &rect);
+        chunk(&mut bytes, b"END\0", b"</roblox>", false);
+
+        let model = decode(&bytes).unwrap();
+        let properties = &model.instances[0].properties;
+        assert_eq!(
+            properties["Target"],
+            Property::Ray {
+                origin: Vec3::new(0.0, 1.0, 2.0),
+                direction: Vec3::new(0.0, 0.0, -1.0),
+            }
+        );
+        assert_eq!(
+            properties["Transparency"],
+            Property::NumberSequence(vec![Vec3::new(0.0, 0.5, 0.0), Vec3::new(1.0, 2.0, 0.25),])
+        );
+        assert_eq!(
+            properties["Color"],
+            Property::ColorSequence(vec![[0.5, 1.0, 0.0, 0.0, 0.25]])
+        );
+        assert_eq!(
+            properties["Range"],
+            Property::NumberRange(Vec2::new(3.0, 9.0))
+        );
+        assert_eq!(
+            properties["CustomPhysicalProperties"],
+            Property::PhysicalProperties {
+                custom: true,
+                values: [0.7, 0.3, 0.5, 1.0, 2.0],
+            }
+        );
+        assert_eq!(properties["Inset"], Property::Other("Rect2D".to_owned()));
+    }
+
+    #[test]
+    fn truncated_variable_length_properties_are_rejected() {
+        for (format, values) in [
+            (21u8, vec![255, 255, 255, 255][..].to_vec()), // keypoint count overflows
+            (22, vec![9, 0, 0, 0, 0, 0, 0, 0][..].to_vec()), // keypoints run short
+            (25, vec![1, 0, 0][..].to_vec()),              // custom flag without values
+        ] {
+            let mut bytes = graph_model(&[0], &[0], &[-1]);
+            bytes.truncate(bytes.len() - 25);
+            prop(&mut bytes, "Broken", format, &values);
+            chunk(&mut bytes, b"END\0", b"</roblox>", false);
+            assert!(decode(&bytes).is_err(), "accepted format {format}");
+        }
     }
 
     #[test]

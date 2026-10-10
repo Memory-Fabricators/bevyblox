@@ -9,3 +9,4 @@ bevy.workspace = true
 bevy_rapier3d.workspace = true
 blox-model.workspace = true
 blox-scene.workspace = true
+blox-script.workspace = true

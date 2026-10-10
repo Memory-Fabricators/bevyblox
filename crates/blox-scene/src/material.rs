@@ -7,6 +7,9 @@ pub const PLASTIC: u32 = 256;
 pub const SMOOTH_PLASTIC: u32 = 272;
 pub const NEON: u32 = 288;
 
+/// MaterialGenerator.cpp::getTiling(PLASTIC): the Uv tiling plastic's normal detail samples at.
+pub const PLASTIC_TILING: f32 = 1.3;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SurfaceMaterial {
     /// Folder under `PlatformContent/pc/textures`.
@@ -18,6 +21,19 @@ pub struct SurfaceMaterial {
     pub gloss_scale: f32,
     /// `CFG_NORMAL_SHADOW_SCALE`: brightens or darkens by the normal's x tilt.
     pub normal_shadow: f32,
+    /// `CFG_SPECULAR_LOD` and `CFG_GLOSS_LOD`: the specular values at the shading distance.
+    pub specular_lod: f32,
+    pub gloss_lod: f32,
+    /// `CFG_NORMAL_DETAIL_TILING` and `CFG_NORMAL_DETAIL_SCALE`: the `normaldetail` map.
+    pub normal_detail_tiling: f32,
+    pub normal_detail_scale: f32,
+    /// `CFG_FAR_TILING`: far-distance tiling of the diffuse, normal and specular maps.
+    pub far_tiling: f32,
+    /// `CFG_FAR_DIFFUSE_CUTOFF`, `CFG_FAR_NORMAL_CUTOFF`, `CFG_FAR_SPECULAR_CUTOFF`. Zero never
+    /// tiles.
+    pub far_diffuse_cutoff: f32,
+    pub far_normal_cutoff: f32,
+    pub far_specular_cutoff: f32,
     /// `CFG_OPT_BLEND_COLOR`: the diffuse alpha selects how much of the part colour applies.
     pub blend_color: bool,
     /// `CFG_OPT_DIFFUSE_CONST`: the diffuse map is ignored; the part colour is used as is.
@@ -26,59 +42,235 @@ pub struct SurfaceMaterial {
     pub normal_const: bool,
 }
 
-const fn surface(
-    folder: &'static str,
-    tiling: f32,
-    specular_scale: f32,
-    gloss_scale: f32,
-    normal_shadow: f32,
-) -> SurfaceMaterial {
-    SurfaceMaterial {
-        folder,
-        tiling,
-        specular_scale,
-        gloss_scale,
-        normal_shadow,
-        blend_color: false,
-        diffuse_const: false,
-        normal_const: false,
-    }
-}
+const BASE: SurfaceMaterial = SurfaceMaterial {
+    folder: "",
+    tiling: 1.0,
+    specular_scale: 1.0,
+    gloss_scale: 1.0,
+    normal_shadow: 0.0,
+    specular_lod: 0.0,
+    gloss_lod: 0.0,
+    normal_detail_tiling: 0.0,
+    normal_detail_scale: 0.0,
+    far_tiling: 0.0,
+    far_diffuse_cutoff: 0.0,
+    far_normal_cutoff: 0.0,
+    far_specular_cutoff: 0.0,
+    blend_color: false,
+    diffuse_const: false,
+    normal_const: false,
+};
 
 /// The textured part material for a `Material` token, or `None` for Plastic, SmoothPlastic,
-/// Neon and the terrain-only tokens (which render as Plastic).
+/// Neon and the terrain-only tokens (which render as Plastic). Values are the `CFG_*` constants
+/// of each shader; Cobblestone's Wang tiling is not ported and uses plain tiling.
 pub fn surface_material(token: u32) -> Option<SurfaceMaterial> {
-    let blend = |m: SurfaceMaterial| SurfaceMaterial {
-        blend_color: true,
-        ..m
-    };
-    let flat_diffuse = |m: SurfaceMaterial| SurfaceMaterial {
-        diffuse_const: true,
-        ..m
-    };
-    let flat_normal = |m: SurfaceMaterial| SurfaceMaterial {
-        normal_const: true,
-        ..m
-    };
     Some(match token {
-        512 => surface("wood", 0.2, 2.0, 256.0, 0.3),
-        528 => blend(surface("woodplanks", 0.2, 2.0, 256.0, 0.3)),
-        784 => flat_normal(surface("marble", 0.1, 1.0, 128.0, 0.1)),
-        800 => surface("slate", 0.1, 0.9, 128.0, 0.5),
-        816 => flat_normal(surface("concrete", 0.15, 1.3, 128.0, 0.0)),
-        832 => flat_normal(surface("granite", 0.1, 0.5, 128.0, 0.1)),
-        848 => blend(surface("brick", 0.125, 1.3, 64.0, 0.1)),
-        864 => surface("pebble", 0.1, 2.5, 128.0, 0.0),
-        // Cobblestone uses Wang tiling in the original; plain tiling at its tile scale here.
-        880 => blend(surface("cobblestone", 0.2, 3.0, 256.0, 0.3)),
-        1040 => blend(surface("rust", 0.1, 1.0, 256.0, 0.5)),
-        1056 => surface("diamondplate", 0.2, 2.7, 256.0, 0.5),
-        1072 => flat_diffuse(surface("aluminum", 0.1, 1.0, 256.0, 0.0)),
-        1088 => surface("metal", 0.2, 2.0, 256.0, 0.3),
-        1280 => blend(surface("grass", 0.15, 1.0, 256.0, 0.5)),
-        1296 => surface("sand", 0.1, 0.4, 32.0, 0.0),
-        1312 => blend(surface("fabric", 0.15, 0.2, 128.0, 0.2)),
-        1536 => flat_diffuse(surface("ice", 0.1, 1.2, 256.0, 0.0)),
+        512 => SurfaceMaterial {
+            folder: "wood",
+            tiling: 0.2,
+            specular_scale: 2.0,
+            gloss_scale: 256.0,
+            normal_shadow: 0.3,
+            specular_lod: 0.25,
+            gloss_lod: 32.0,
+            normal_detail_tiling: 7.0,
+            normal_detail_scale: 0.6,
+            ..BASE
+        },
+        528 => SurfaceMaterial {
+            folder: "woodplanks",
+            tiling: 0.2,
+            specular_scale: 2.0,
+            gloss_scale: 256.0,
+            normal_shadow: 0.3,
+            specular_lod: 0.28,
+            gloss_lod: 53.0,
+            blend_color: true,
+            ..BASE
+        },
+        784 => SurfaceMaterial {
+            folder: "marble",
+            tiling: 0.1,
+            specular_scale: 1.0,
+            gloss_scale: 128.0,
+            normal_shadow: 0.1,
+            specular_lod: 0.7,
+            gloss_lod: 54.0,
+            normal_const: true,
+            ..BASE
+        },
+        800 => SurfaceMaterial {
+            folder: "slate",
+            tiling: 0.1,
+            specular_scale: 0.9,
+            gloss_scale: 128.0,
+            normal_shadow: 0.5,
+            specular_lod: 0.14,
+            gloss_lod: 20.0,
+            normal_detail_tiling: 5.0,
+            normal_detail_scale: 1.0,
+            far_tiling: 0.25,
+            far_diffuse_cutoff: 0.75,
+            ..BASE
+        },
+        816 => SurfaceMaterial {
+            folder: "concrete",
+            tiling: 0.15,
+            specular_scale: 1.3,
+            gloss_scale: 128.0,
+            normal_shadow: 0.0,
+            specular_lod: 0.07,
+            gloss_lod: 22.0,
+            normal_detail_tiling: 10.0,
+            normal_detail_scale: 1.0,
+            far_tiling: 0.25,
+            far_diffuse_cutoff: 0.75,
+            normal_const: true,
+            ..BASE
+        },
+        832 => SurfaceMaterial {
+            folder: "granite",
+            tiling: 0.1,
+            specular_scale: 0.5,
+            gloss_scale: 128.0,
+            normal_shadow: 0.1,
+            specular_lod: 0.19,
+            gloss_lod: 24.0,
+            far_tiling: 0.25,
+            far_diffuse_cutoff: 0.6,
+            normal_const: true,
+            ..BASE
+        },
+        848 => SurfaceMaterial {
+            folder: "brick",
+            tiling: 0.125,
+            specular_scale: 1.3,
+            gloss_scale: 64.0,
+            normal_shadow: 0.1,
+            specular_lod: 0.13,
+            gloss_lod: 44.0,
+            blend_color: true,
+            ..BASE
+        },
+        864 => SurfaceMaterial {
+            folder: "pebble",
+            tiling: 0.1,
+            specular_scale: 2.5,
+            gloss_scale: 128.0,
+            normal_shadow: 0.0,
+            specular_lod: 0.15,
+            gloss_lod: 22.0,
+            normal_detail_tiling: 6.0,
+            normal_detail_scale: 1.5,
+            ..BASE
+        },
+        880 => SurfaceMaterial {
+            folder: "cobblestone",
+            tiling: 0.2,
+            specular_scale: 3.0,
+            gloss_scale: 256.0,
+            normal_shadow: 0.3,
+            specular_lod: 0.21,
+            gloss_lod: 22.0,
+            blend_color: true,
+            ..BASE
+        },
+        1040 => SurfaceMaterial {
+            folder: "rust",
+            tiling: 0.1,
+            specular_scale: 1.0,
+            gloss_scale: 256.0,
+            normal_shadow: 0.5,
+            specular_lod: 0.35,
+            gloss_lod: 103.0,
+            far_tiling: 0.5,
+            far_diffuse_cutoff: 0.6,
+            blend_color: true,
+            ..BASE
+        },
+        1056 => SurfaceMaterial {
+            folder: "diamondplate",
+            tiling: 0.2,
+            specular_scale: 2.7,
+            gloss_scale: 256.0,
+            normal_shadow: 0.5,
+            specular_lod: 0.9,
+            gloss_lod: 160.0,
+            ..BASE
+        },
+        1072 => SurfaceMaterial {
+            folder: "aluminum",
+            tiling: 0.1,
+            specular_scale: 1.0,
+            gloss_scale: 256.0,
+            normal_shadow: 0.0,
+            specular_lod: 0.94,
+            gloss_lod: 240.0,
+            far_tiling: 0.25,
+            far_normal_cutoff: 0.75,
+            diffuse_const: true,
+            ..BASE
+        },
+        1088 => SurfaceMaterial {
+            folder: "metal",
+            tiling: 0.2,
+            specular_scale: 2.0,
+            gloss_scale: 256.0,
+            normal_shadow: 0.3,
+            specular_lod: 0.8,
+            gloss_lod: 120.0,
+            far_tiling: 0.25,
+            far_specular_cutoff: 0.75,
+            ..BASE
+        },
+        1280 => SurfaceMaterial {
+            folder: "grass",
+            tiling: 0.15,
+            specular_scale: 1.0,
+            gloss_scale: 256.0,
+            normal_shadow: 0.5,
+            specular_lod: 0.17,
+            gloss_lod: 18.0,
+            far_tiling: 0.25,
+            far_diffuse_cutoff: 0.6,
+            blend_color: true,
+            ..BASE
+        },
+        1296 => SurfaceMaterial {
+            folder: "sand",
+            tiling: 0.1,
+            specular_scale: 0.4,
+            gloss_scale: 32.0,
+            normal_shadow: 0.0,
+            specular_lod: 0.07,
+            gloss_lod: 6.0,
+            ..BASE
+        },
+        1312 => SurfaceMaterial {
+            folder: "fabric",
+            tiling: 0.15,
+            specular_scale: 0.2,
+            gloss_scale: 128.0,
+            normal_shadow: 0.2,
+            specular_lod: 0.03,
+            gloss_lod: 16.0,
+            blend_color: true,
+            ..BASE
+        },
+        1536 => SurfaceMaterial {
+            folder: "ice",
+            tiling: 0.1,
+            specular_scale: 1.2,
+            gloss_scale: 256.0,
+            normal_shadow: 0.0,
+            specular_lod: 1.0,
+            gloss_lod: 190.0,
+            far_tiling: 0.25,
+            far_specular_cutoff: 0.75,
+            diffuse_const: true,
+            ..BASE
+        },
         _ => return None,
     })
 }
@@ -95,13 +287,19 @@ mod tests {
         for token in 0..2100 {
             if let Some(material) = surface_material(token) {
                 seen += 1;
-                for file in ["diffuse.dds", "normal.dds", "specular.dds"] {
+                for file in [
+                    "diffuse.dds",
+                    "normal.dds",
+                    "specular.dds",
+                    "normaldetail.dds",
+                ] {
                     let path = root.join(material.folder).join(file);
                     assert!(path.is_file(), "{}", path.display());
                 }
             }
         }
         assert_eq!(seen, 17);
+        assert!(root.join("plastic").join("normaldetail.dds").is_file());
     }
 
     #[test]

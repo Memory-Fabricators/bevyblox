@@ -38,6 +38,7 @@ pub const FLAG_DIFFUSE_CONST: u32 = 64;
 pub const FLAG_NORMAL: u32 = 128;
 pub const FLAG_SPECULAR: u32 = 256;
 pub const FLAG_WHOLE_STUD_OFFSET: u32 = 512;
+pub const FLAG_DETAIL: u32 = 1024;
 
 #[derive(Clone, Debug, PartialEq, bevy::render::render_resource::ShaderType)]
 pub struct LegacyUniform {
@@ -49,6 +50,8 @@ pub struct LegacyUniform {
     fog: Vec4,
     spec: Vec4,
     tex: Vec4,
+    detail: Vec4,
+    far: Vec4,
     packed: UVec4,
 }
 
@@ -65,6 +68,9 @@ pub struct LegacyMaterial {
     #[texture(5)]
     #[sampler(6)]
     pub specular: Option<Handle<Image>>,
+    #[texture(7)]
+    #[sampler(8)]
+    pub detail_map: Option<Handle<Image>>,
     pub alpha_mode: AlphaMode,
     /// Decals use a depth bias so they win against the part they sit on.
     pub depth_bias: f32,
@@ -100,6 +106,12 @@ pub struct Appearance {
     pub specular_map: Option<Handle<Image>>,
     /// Texture repeats per stud, specular scale, gloss scale, normal shadow scale.
     pub tex: [f32; 4],
+    /// legacy.wesl `detail`: normal detail tiling and scale, and the far tiling of material maps.
+    pub detail: [f32; 4],
+    /// legacy.wesl `far`: cutoffs of the far-distance cross-fade for diffuse, normal and specular.
+    pub far: [f32; 4],
+    /// `normaldetail.dds` for FLAG_DETAIL.
+    pub detail_map: Option<Handle<Image>>,
 }
 
 impl LegacyMaterial {
@@ -112,6 +124,7 @@ impl LegacyMaterial {
             .fold(0u32, |bits, (face, ty)| {
                 bits | (u32::from(*ty & 15) << (4 * face))
             });
+        let (fog_start, fog_end) = lighting.fog_range();
         Self {
             data: LegacyUniform {
                 color: Vec4::new(
@@ -124,14 +137,17 @@ impl LegacyMaterial {
                 key: rgb(shading.key),
                 fill: rgb(shading.fill),
                 fog_color: rgb(lighting.fog_color),
-                fog: Vec4::new(lighting.fog_start, lighting.fog_end, SHADING_DISTANCE, 0.0),
+                fog: Vec4::new(fog_start, fog_end, SHADING_DISTANCE, 0.0),
                 spec: Vec4::new(appearance.specular.0, appearance.specular.1, 0.0, 0.0),
                 tex: Vec4::from_array(appearance.tex),
+                detail: Vec4::from_array(appearance.detail),
+                far: Vec4::from_array(appearance.far),
                 packed: UVec4::new(surfaces, appearance.flags, 0, 0),
             },
             texture: appearance.texture.clone(),
             normal: appearance.normal.clone(),
             specular: appearance.specular_map.clone(),
+            detail_map: appearance.detail_map.clone(),
             alpha_mode: if appearance.alpha < 1.0 {
                 AlphaMode::Blend
             } else {

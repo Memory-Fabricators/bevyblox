@@ -1,0 +1,10 @@
+[package]
+name = "blox-script"
+description = "Luau script host and Roblox instance bridge for the Bevy viewer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+blox-model.workspace = true
+glam.workspace = true
+mlua.workspace = true

@@ -11,6 +11,14 @@ bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", features =
 bevy_rapier3d = { git = "https://github.com/dimforge/rapier", default-features = false, features = ["dim3", "async-collider"] }
 blox-model = { path = "crates/blox-model" }
 blox-scene = { path = "crates/blox-scene" }
+blox-script = { path = "crates/blox-script" }
+rootcause = "0.13.0"
+# Pinned to the version bevy_math resolves so blox-model's Vec3/Mat3 are the
+# same types Bevy uses; a different minor pulls in a second glam copy.
+glam = "=0.33.12"
+lz4rip = "0.11.10"
+# No `send`: the Luau state lives on the main thread in a NonSend resource.
+mlua = { version = "0.12.2", default-features = false, features = ["luau-jit", "luau-vector4"] }
 
 [profile.dev.package."*"]
 opt-level = 3

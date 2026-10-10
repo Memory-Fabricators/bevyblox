@@ -19,10 +19,17 @@ struct Legacy {
     fog_color: vec4<f32>,
     // x: FogStart, y: FogEnd, z: shading distance (outline and detail fade), w: unused.
     fog: vec4<f32>,
-    // x: specular intensity, y: specular power (also the far-LOD values for specular maps).
+    // x: specular intensity, y: specular power. Materials put CFG_SPECULAR_LOD and
+    // CFG_GLOSS_LOD here: the far-distance values the specular map fades to.
     spec: vec4<f32>,
-    // x: texture repeats per stud, y: CFG_SPECULAR_SCALE, z: CFG_GLOSS_SCALE, w: CFG_NORMAL_SHADOW_SCALE.
+    // x: texture repeats per stud (getTiling), y: CFG_SPECULAR_SCALE, z: CFG_GLOSS_SCALE,
+    // w: CFG_NORMAL_SHADOW_SCALE.
     tex: vec4<f32>,
+    // x: normal detail tiling (CFG_NORMAL_DETAIL_TILING; plastic: its 1.3 Uv tiling),
+    // y: CFG_NORMAL_DETAIL_SCALE, z: CFG_FAR_TILING, w: unused.
+    detail: vec4<f32>,
+    // x: CFG_FAR_DIFFUSE_CUTOFF, y: CFG_FAR_NORMAL_CUTOFF, z: CFG_FAR_SPECULAR_CUTOFF, w: unused.
+    far: vec4<f32>,
     // x: six 4-bit SurfaceType values in NormalId order, y: flags.
     packed: vec4<u32>,
 }
@@ -30,13 +37,18 @@ struct Legacy {
 const FLAG_STUDS: u32 = 1u;        // plastic: texture 1 is the stud atlas, texture 3 its normal map
 const FLAG_OUTLINE: u32 = 2u;
 const FLAG_TEXTURE: u32 = 4u;      // decal / mesh texture on texture 1, sampled with mesh UVs
-const FLAG_UNLIT: u32 = 8u;
+const FLAG_UNLIT: u32 = 8u;        // neon
 const FLAG_MATERIAL: u32 = 16u;    // texture 1 is a tiled material diffuse map
 const FLAG_BLEND: u32 = 32u;       // CFG_OPT_BLEND_COLOR
 const FLAG_DIFFUSE_CONST: u32 = 64u;
 const FLAG_NORMAL: u32 = 128u;     // texture 3 is a normal map
 const FLAG_SPECULAR: u32 = 256u;   // texture 5 is a specular map
 const FLAG_WHOLE_STUD_OFFSET: u32 = 512u;
+const FLAG_DETAIL: u32 = 1024u;    // texture 7 is the normal detail map
+
+// RenderView.cpp: OutlineBrightnessMax 160 and OutlineBrightnessMin 50, both over 255.
+const OUTLINE_BRIGHTNESS_MUL: f32 = 110.0 / 255.0;
+const OUTLINE_BRIGHTNESS_ADD: f32 = 50.0 / 255.0;
 
 const SURFACE_NO_OUTLINES: u32 = 10u;
 
@@ -47,6 +59,8 @@ const SURFACE_NO_OUTLINES: u32 = 10u;
 @group(constants::MATERIAL_BIND_GROUP) @binding(4) var sampler_b: sampler;
 @group(constants::MATERIAL_BIND_GROUP) @binding(5) var texture_c: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(6) var sampler_c: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(7) var texture_d: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(8) var sampler_d: sampler;
 
 fn to_linear(c: vec3<f32>) -> vec3<f32> {
     let low = c / 12.92;
@@ -92,11 +106,65 @@ fn face_tangent(face: u32) -> vec3<f32> {
     }
 }
 
-fn edge_distance(face: u32, p: vec3<f32>, size: vec3<f32>) -> f32 {
-    let h = 0.5 * size - abs(p);
-    if (face == 0u || face == 3u) { return min(h.y, h.z); }
-    if (face == 1u || face == 4u) { return min(h.x, h.z); }
-    return min(h.x, h.y);
+// NormalId order: +X 0, +Y 1, +Z 2, -X 3, -Y 4, -Z 5. The four faces sharing an edge with `face`,
+// in computeOutlineOffsetPart order (GeometryGenerator.cpp).
+fn edge_neighbours(face: u32) -> vec4<u32> {
+    switch face {
+        case 0u: { return vec4<u32>(5u, 2u, 1u, 4u); }
+        case 1u: { return vec4<u32>(3u, 0u, 2u, 5u); }
+        case 2u: { return vec4<u32>(0u, 3u, 1u, 4u); }
+        case 3u: { return vec4<u32>(2u, 5u, 1u, 4u); }
+        case 4u: { return vec4<u32>(3u, 0u, 5u, 2u); }
+        default: { return vec4<u32>(3u, 0u, 1u, 4u); }
+    }
+}
+
+// Distance in studs from the face point to its nearest outline edge. An edge shared with a
+// NO_OUTLINES face is pushed out by 10 studs (NO_OUTLINES), as computeOutlineOffsetPart does.
+fn min_edge_distance(face: u32, p: vec3<f32>, size: vec3<f32>, surfaces: u32) -> f32 {
+    let neighbours = edge_neighbours(face);
+    var nearest = 1.0e9;
+    for (var k = 0u; k < 4u; k++) {
+        let n = neighbours[k];
+        let axis = n % 3u;
+        let sign = select(-1.0, 1.0, n < 3u);
+        var d = 0.5 * size[axis] - sign * p[axis];
+        if (((surfaces >> (4u * n)) & 15u) == SURFACE_NO_OUTLINES) {
+            d += 10.0;
+        }
+        nearest = min(nearest, d);
+    }
+    return nearest;
+}
+
+// material.hlsl sampleFar: beyond the fade the map is sampled at CFG_FAR_TILING and cross-faded
+// back to the near sample as fade drops below 1 - cutoff. A zero cutoff never tiles.
+fn sample_far(
+    t: texture_2d<f32>,
+    s: sampler,
+    uv: vec2<f32>,
+    dx: vec2<f32>,
+    dy: vec2<f32>,
+    fade: f32,
+    cutoff: f32,
+    far_tiling: f32,
+) -> vec4<f32> {
+    let near = textureSampleGrad(t, s, uv, dx, dy);
+    if (cutoff == 0.0) {
+        return near;
+    }
+    let cscale = 1.0 / (1.0 - cutoff);
+    let far = textureSampleGrad(t, s, uv * far_tiling, dx * far_tiling, dy * far_tiling);
+    return mix(far, near, saturate(fade * cscale - cutoff * cscale));
+}
+
+// default.hlsl linear fog on view depth. updateFog keeps FogStart below FogEnd, so the range is
+// never empty; equal values mean no fog.
+fn fog_alpha(depth: f32) -> f32 {
+    if (material.fog.x == material.fog.y) {
+        return 1.0;
+    }
+    return saturate((material.fog.y - depth) / (material.fog.y - material.fog.x));
 }
 
 // Row of the stud atlas for a SurfaceType (getStudsAtlasInfo): studs, weld/glue, inlet,
@@ -138,7 +206,18 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         view.view_from_world[3].z,
     ), in.world_position);
     let depth = max(-view_z, 0.001);
+    // default.hlsl fade: 1 at the camera, 0 at the shading distance. Detail and far maps fade with it.
     let fade = saturate(1.0 - depth / material.fog.z);
+
+    var out: FragmentOutput;
+    if ((flags & FLAG_UNLIT) != 0u) {
+        // neon.hlsl: the flat part colour (glow 1), then the fog blend. No outline or lighting.
+        out.color = vec4<f32>(
+            to_linear(saturate(mix(material.fog_color.rgb, material.color.rgb, fog_alpha(depth)))),
+            material.color.a,
+        );
+        return out;
+    }
 
     var albedo = material.color.rgb;
     var alpha = material.color.a;
@@ -170,14 +249,16 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         let uv_dx = face_uv(face, p + dpdx(p), size) - uv;
         let uv_dy = face_uv(face, p + dpdy(p), size) - uv;
         // Project the U direction onto the actual surface, including wedge slopes and
-        // curved geometry. Dominant-axis selection keeps this vector away from zero.
+        // curved geometry. Dominant-axis selection keeps this vector away from zero. The frame
+        // comes from the vertex normal, before any normal map perturbs `n`.
         let projected_tangent = basis * face_tangent(face);
         let tangent = normalize(projected_tangent - n * dot(n, projected_tangent));
         let bitangent = cross(n, tangent);
 
         if ((flags & FLAG_STUDS) != 0u) {
-            // plastic.hlsl: albedo = Color * (atlas.r * 2); stud normal at half strength. Studs
-            // repeat every 2 studs in U and every 8 studs in V inside the surface's atlas row.
+            // plastic.hlsl (PIN_HQ): albedo = Color * studs.r * 2 from this surface's atlas row.
+            // The stud normal map is used at full strength. Detail noise is scaled by
+            // Color.a - 0.5 (CFG_BUMP_INTENSITY 0.5). z is not faded; only x and y are.
             let row = atlas_row(surface);
             let s_uv = select(
                 vec2<f32>(0.0),
@@ -187,11 +268,18 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
             let scale = vec2<f32>(0.5, 0.25 / 8.0) * row.x;
             let a = textureSampleGrad(texture_a, sampler_a, s_uv, uv_dx * scale, uv_dy * scale);
             albedo = albedo * a.r * 2.0;
+            var t = vec3<f32>(0.0, 0.0, 1.0);
             if ((flags & FLAG_NORMAL) != 0u) {
-                let t = nmap_unpack(textureSampleGrad(texture_b, sampler_b, s_uv, uv_dx * scale, uv_dy * scale));
-                let xy = t.xy * 0.5 * fade;
-                n = normalize(xy.x * tangent + xy.y * bitangent + n * sqrt(saturate(1.0 - dot(xy, xy))));
+                t = nmap_unpack(textureSampleGrad(texture_b, sampler_b, s_uv, uv_dx * scale, uv_dy * scale));
             }
+            var xy = t.xy;
+            if ((flags & FLAG_DETAIL) != 0u) {
+                let k = material.detail.x;
+                let noise = nmap_unpack(textureSampleGrad(texture_d, sampler_d, uv * k, uv_dx * k, uv_dy * k));
+                xy += noise.xy * saturate(material.color.a - 0.5);
+            }
+            xy = xy * fade;
+            n = normalize(xy.x * tangent + xy.y * bitangent + t.z * n);
         }
 
         if ((flags & FLAG_MATERIAL) != 0u) {
@@ -203,18 +291,29 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
             } else {
                 offset = 0.5 * (size.x + size.y + size.z) * (random * 2.0 - 1.0);
             }
-            let m_uv = (uv + offset) * material.tex.x;
-            let m_dx = uv_dx * material.tex.x;
-            let m_dy = uv_dy * material.tex.x;
-            var shadow_factor = 1.0;
+            let tiling = material.tex.x;
+            let far_tiling = material.detail.z;
+            let m_uv = (uv + offset) * tiling;
+            let m_dx = uv_dx * tiling;
+            let m_dy = uv_dy * tiling;
+
+            var t = vec3<f32>(0.0, 0.0, 1.0);
             if ((flags & FLAG_NORMAL) != 0u) {
-                let t = nmap_unpack(textureSampleGrad(texture_b, sampler_b, m_uv, m_dx, m_dy));
-                let xy = t.xy * fade;
-                shadow_factor = 1.0 + xy.x * material.tex.w;
-                n = normalize(xy.x * tangent + xy.y * bitangent + n * sqrt(saturate(1.0 - dot(xy, xy))));
+                t = nmap_unpack(sample_far(texture_b, sampler_b, m_uv, m_dx, m_dy, fade, material.far.y, far_tiling));
             }
+            var xy = t.xy;
+            if ((flags & FLAG_DETAIL) != 0u) {
+                // Applied even when the normal map is constant (CFG_OPT_NORMAL_CONST).
+                let k = material.detail.x;
+                let detail = nmap_unpack(textureSampleGrad(texture_d, sampler_d, m_uv * k, m_dx * k, m_dy * k));
+                xy += detail.xy * material.detail.y;
+            }
+            xy = xy * fade;
+            let shadow_factor = 1.0 + xy.x * material.tex.w;
+            n = normalize(xy.x * tangent + xy.y * bitangent + t.z * n);
+
             if ((flags & FLAG_DIFFUSE_CONST) == 0u) {
-                let d = textureSampleGrad(texture_a, sampler_a, m_uv, m_dx, m_dy);
+                let d = sample_far(texture_a, sampler_a, m_uv, m_dx, m_dy, fade, material.far.x, far_tiling);
                 if ((flags & FLAG_BLEND) != 0u) {
                     albedo = mix(vec3<f32>(1.0), albedo, d.a) * d.rgb;
                 } else {
@@ -223,51 +322,48 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
             }
             albedo = albedo * shadow_factor;
             if ((flags & FLAG_SPECULAR) != 0u) {
-                let s = textureSampleGrad(texture_c, sampler_c, m_uv, m_dx, m_dy);
-                spec_intensity = mix(spec_intensity, s.r * material.tex.y, fade);
-                spec_power = mix(spec_power, s.g * material.tex.z + 0.01, fade);
+                let s = sample_far(texture_c, sampler_c, m_uv, m_dx, m_dy, fade, material.far.z, far_tiling).rg;
+                // specfade = lerp((CFG_SPECULAR_LOD, CFG_GLOSS_LOD), specular * scales + (0, 0.01), fade)
+                spec_intensity = mix(material.spec.x, s.r * material.tex.y, fade);
+                spec_power = mix(material.spec.y, s.g * material.tex.z + 0.01, fade);
             }
         }
 
         if ((flags & FLAG_OUTLINE) != 0u && surface != SURFACE_NO_OUTLINES) {
-            // default.hlsl: darken a ~2px band along face edges, fading with distance.
-            let d = edge_distance(face, p, size);
-            let depth_mul = depth / material.fog.z;
-            let outline_fade = saturate(depth_mul * 0.43137 + 0.19608);
+            // default.hlsl PIN_HQ: outlineFade = saturate(depth / shading * mul + add), and the
+            // nearest edge in pixels (outlineScaling = fov * height / 8 at OutlineThickness 40).
+            let outline_fade = saturate(depth / material.fog.z * OUTLINE_BRIGHTNESS_MUL + OUTLINE_BRIGHTNESS_ADD);
+            let d = min_edge_distance(face, p, size, material.packed.x);
             let edges = 0.5 + d * view.clip_from_view[1][1] * view.viewport.w / (8.0 * depth);
             outline = saturate(outline_fade * (1.5 - edges) + edges);
         }
     }
 
-    var rgb = albedo * outline;
-    if ((flags & FLAG_UNLIT) == 0u) {
-        var light_dir = vec3<f32>(0.0, 1.0, 0.0);
-        var lit = 1.0;
-        if (view_bindings::lights.n_directional_lights > 0u) {
-            let light = view_bindings::lights.directional_lights[0];
-            light_dir = light.direction_to_light;
-            if ((light.flags & 1u) != 0u) {
-                lit = shadows::fetch_directional_shadow(0u, in.world_position, normalize(in.world_normal), view_z, in.position.xy);
-            }
+    // common.h: shadows attenuate the key light only, by at most 75% and less at low sun.
+    var light_dir = vec3<f32>(0.0, 1.0, 0.0);
+    var lit = 1.0;
+    if (view_bindings::lights.n_directional_lights > 0u) {
+        let light = view_bindings::lights.directional_lights[0];
+        light_dir = light.direction_to_light;
+        if ((light.flags & 1u) != 0u) {
+            lit = shadows::fetch_directional_shadow(0u, in.world_position, normalize(in.world_normal), view_z, in.position.xy);
         }
-        // common.h: shadows only attenuate the key light, by at most 75% and less at low sun.
-        let shadow = 1.0 - (1.0 - lit) * pow(saturate(light_dir.y), 0.25) * 0.75;
-        let ndotl = dot(n, light_dir);
-        let to_view = normalize(view.world_position.xyz - in.world_position.xyz);
-        let half_vec = normalize(light_dir + to_view);
-        let diffuse = saturate(ndotl) * material.key.rgb + max(-ndotl, 0.0) * material.fill.rgb;
-        let specular = material.key.rgb * spec_intensity * step(0.0, ndotl) * shadow
-            * pow(saturate(dot(n, half_vec)), spec_power);
-        rgb = (material.ambient.rgb + diffuse * shadow) * rgb + specular;
     }
+    let shadow = 1.0 - (1.0 - lit) * pow(saturate(light_dir.y), 0.25) * 0.75;
 
-    // default.hlsl: linear fog on view depth; FogStart == FogEnd disables it.
-    if (material.fog.x != material.fog.y) {
-        let fog_alpha = saturate((material.fog.y - depth) / (material.fog.y - material.fog.x));
-        rgb = mix(material.fog_color.rgb, rgb, fog_alpha);
-    }
+    // default.hlsl: (ambient + diffuse * shadow) * albedo + specular, then the outline darkens all
+    // of it, then the fog blend.
+    let ndotl = dot(n, light_dir);
+    let to_view = normalize(view.world_position.xyz - in.world_position.xyz);
+    let half_vec = normalize(light_dir + to_view);
+    let diffuse = saturate(ndotl) * material.key.rgb + max(-ndotl, 0.0) * material.fill.rgb;
+    let specular = material.key.rgb * spec_intensity * step(0.0, ndotl) * shadow
+        * pow(saturate(dot(n, half_vec)), spec_power);
+    var rgb = ((material.ambient.rgb + diffuse * shadow) * albedo + specular) * outline;
 
-    var out: FragmentOutput;
-    out.color = vec4<f32>(to_linear(saturate(rgb)), alpha);
-    return out;
+    rgb = mix(material.fog_color.rgb, rgb, fog_alpha(depth));
+
+    var out_lit: FragmentOutput;
+    out_lit.color = vec4<f32>(to_linear(saturate(rgb)), alpha);
+    return out_lit;
 }

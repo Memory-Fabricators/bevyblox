@@ -1,4 +1,5 @@
 use super::{Model, ModelError, ModelInstance, ModelResult, Property};
+use glam::{Mat3, Vec3};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -387,11 +388,11 @@ fn component(arena: &[Element<'_>], element: &Element<'_>, tag: &str) -> ModelRe
 }
 
 fn packed_color(value: u32) -> Property {
-    Property::Color3([
+    Property::Color3(Vec3::new(
         ((value >> 16) & 255) as f32 / 255.0,
         ((value >> 8) & 255) as f32 / 255.0,
         (value & 255) as f32 / 255.0,
-    ])
+    ))
 }
 
 fn property(arena: &[Element<'_>], element: &Element<'_>) -> ModelResult<Property> {
@@ -419,46 +420,43 @@ fn property(arena: &[Element<'_>], element: &Element<'_>) -> ModelResult<Propert
         "float" | "double" => Property::Float(number(element.scalar()?, element.tag)?),
         "Vector3" => {
             element.structural()?;
-            Property::Vector3([
+            Property::Vector3(Vec3::new(
                 component(arena, element, "X")?,
                 component(arena, element, "Y")?,
                 component(arena, element, "Z")?,
-            ])
+            ))
         }
         "CoordinateFrame" => {
             element.structural()?;
+            // Stored row-major: R00 R01 R02 / R10 R11 R12 / R20 R21 R22.
+            let row = |prefix: &str| -> ModelResult<Vec3> {
+                Ok(Vec3::new(
+                    component(arena, element, &format!("{prefix}0"))?,
+                    component(arena, element, &format!("{prefix}1"))?,
+                    component(arena, element, &format!("{prefix}2"))?,
+                ))
+            };
+            let (r0, r1, r2) = (row("R0")?, row("R1")?, row("R2")?);
             Property::CFrame {
-                position: [
+                position: Vec3::new(
                     component(arena, element, "X")?,
                     component(arena, element, "Y")?,
                     component(arena, element, "Z")?,
-                ],
-                rotation: [
-                    [
-                        component(arena, element, "R00")?,
-                        component(arena, element, "R01")?,
-                        component(arena, element, "R02")?,
-                    ],
-                    [
-                        component(arena, element, "R10")?,
-                        component(arena, element, "R11")?,
-                        component(arena, element, "R12")?,
-                    ],
-                    [
-                        component(arena, element, "R20")?,
-                        component(arena, element, "R21")?,
-                        component(arena, element, "R22")?,
-                    ],
-                ],
+                ),
+                rotation: Mat3::from_cols(
+                    Vec3::new(r0.x, r1.x, r2.x),
+                    Vec3::new(r0.y, r1.y, r2.y),
+                    Vec3::new(r0.z, r1.z, r2.z),
+                ),
             }
         }
         "Color3" if !element.children.is_empty() => {
             element.structural()?;
-            Property::Color3([
+            Property::Color3(Vec3::new(
                 component(arena, element, "R")?,
                 component(arena, element, "G")?,
                 component(arena, element, "B")?,
-            ])
+            ))
         }
         "Color3" | "Color3uint8" => packed_color(number(element.scalar()?, element.tag)?),
         "Ref" => Property::Ref(match element.scalar()?.trim() {
@@ -483,8 +481,59 @@ fn property(arena: &[Element<'_>], element: &Element<'_>) -> ModelResult<Propert
                 }
             }
         }
+        // `BinaryString` is base64 in XML (`EnumProperty.cpp::readValue`) so it can round-trip
+        // through a text format.
+        "BinaryString" => Property::Binary(decode_base64(element.scalar()?)?),
         tag => Property::Other(tag.into()),
     })
+}
+
+/// Standard-alphabet base64, ignoring whitespace, as `util/base64.hpp` accepts.
+fn decode_base64(text: &str) -> ModelResult<Vec<u8>> {
+    const VALUE: [u8; 256] = {
+        let mut table = [255u8; 256];
+        let mut index = 0;
+        while index < 26 {
+            table[b'A' as usize + index] = index as u8;
+            table[b'a' as usize + index] = index as u8 + 26;
+            index += 1;
+        }
+        let mut digit = 0;
+        while digit < 10 {
+            table[b'0' as usize + digit] = digit as u8 + 52;
+            digit += 1;
+        }
+        table[b'+' as usize] = 62;
+        table[b'/' as usize] = 63;
+        table
+    };
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut accumulator = 0u32;
+    let mut bits = 0u32;
+    let mut padding = 0;
+    for byte in text.bytes() {
+        if byte == b'=' {
+            padding += 1;
+            continue;
+        }
+        let value = VALUE[byte as usize];
+        if value == 255 {
+            if byte.is_ascii_whitespace() {
+                continue;
+            }
+            return Err(ModelError("invalid base64 in BinaryString".into()));
+        }
+        if padding != 0 {
+            return Err(ModelError("base64 data after padding".into()));
+        }
+        accumulator = (accumulator << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+        }
+    }
+    Ok(out)
 }
 
 pub(super) fn decode(bytes: &[u8]) -> ModelResult<Model> {
@@ -665,13 +714,20 @@ mod tests {
             ),
             ("Part", "Block", Some("m"))
         );
-        assert_eq!(part.properties["size"], Property::Vector3([2.0, 3.0, 4.0]));
+        assert_eq!(
+            part.properties["size"],
+            Property::Vector3(Vec3::new(2.0, 3.0, 4.0))
+        );
         assert!(!part.properties.contains_key("Size"));
         assert_eq!(
             part.properties["CFrame"],
             Property::CFrame {
-                position: [5.0, 6.0, 7.0],
-                rotation: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                position: Vec3::new(5.0, 6.0, 7.0),
+                rotation: Mat3::from_cols(
+                    Vec3::new(0.0, 1.0, 0.0),
+                    Vec3::new(-1.0, 0.0, 0.0),
+                    Vec3::new(0.0, 0.0, 1.0),
+                ),
             }
         );
         assert_eq!(part.properties["BrickColor"], Property::Int(24));
@@ -681,12 +737,12 @@ mod tests {
         assert_eq!(part.properties["Reflectance"], Property::Float(0.25));
         assert_eq!(
             part.properties["Color"],
-            Property::Color3([17.0 / 255.0, 34.0 / 255.0, 51.0 / 255.0])
+            Property::Color3(Vec3::new(17.0 / 255.0, 34.0 / 255.0, 51.0 / 255.0))
         );
         assert_eq!(part.properties["Color3uint8"], part.properties["Color"]);
         assert_eq!(
             part.properties["VertexColor"],
-            Property::Color3([0.25, 0.5, 1.0])
+            Property::Color3(Vec3::new(0.25, 0.5, 1.0))
         );
         assert_eq!(part.properties["Missing"], Property::Ref(None));
         assert_eq!(
@@ -742,12 +798,19 @@ mod tests {
         assert_eq!(head.name, "Head");
         assert_eq!(head.parent.as_deref(), Some("RBX0"));
         assert_eq!(head.properties["BrickColor"], Property::Int(24));
-        assert_eq!(head.properties["size"], Property::Vector3([2.0, 1.0, 1.0]));
+        assert_eq!(
+            head.properties["size"],
+            Property::Vector3(Vec3::new(2.0, 1.0, 1.0))
+        );
         assert_eq!(
             head.properties["CFrame"],
             Property::CFrame {
-                position: [0.0, 4.5, 25.5],
-                rotation: [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]],
+                position: Vec3::new(0.0, 4.5, 25.5),
+                rotation: Mat3::from_cols(
+                    Vec3::new(-1.0, 0.0, 0.0),
+                    Vec3::new(0.0, 1.0, 0.0),
+                    Vec3::new(0.0, 0.0, -1.0),
+                ),
             }
         );
         let mesh = get("RBX2");
@@ -755,7 +818,7 @@ mod tests {
         assert_eq!(mesh.parent.as_deref(), Some("RBX1"));
         assert_eq!(
             mesh.properties["Scale"],
-            Property::Vector3([1.25, 1.25, 1.25])
+            Property::Vector3(Vec3::new(1.25, 1.25, 1.25))
         );
         assert_eq!(mesh.properties["MeshId"], Property::Text(String::new()));
         assert_eq!(

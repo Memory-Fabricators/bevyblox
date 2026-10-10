@@ -13,10 +13,12 @@ use blox_scene::{
 
 mod first_person;
 mod legacy;
+mod scripting;
 mod walk;
 use blox_scene::lighting::Lighting;
 use first_person::{FirstPersonCamera, FirstPersonPlugin, InitialView, Locomotion};
 use legacy::{Appearance, LegacyMaterial, LegacyRenderPlugin};
+use scripting::PartLink;
 
 #[derive(Resource)]
 struct PreparedScene {
@@ -25,6 +27,10 @@ struct PreparedScene {
     mesh_indices: Vec<usize>,
     transforms: Vec<Transform>,
     surfaces: Surfaces,
+    /// Solid and water terrain meshes, empty when the place has no terrain.
+    terrain: blox_scene::terrain::TerrainMesh,
+    /// One box collider per solid terrain cell, at its cell center.
+    terrain_colliders: Vec<Vec3>,
     center: Vec3,
     radius: f32,
     /// Static collision shape per part (`None` for `CanCollide = false` or unusable meshes).
@@ -106,6 +112,7 @@ fn prepare_surfaces(
     };
     let mut part_images = Vec::with_capacity(snapshot.parts.len());
     let mut decals = Vec::new();
+    let mut unported_decals = 0usize;
     for (part_index, part) in snapshot.parts.iter().enumerate() {
         part_images.push(
             part.texture
@@ -131,11 +138,7 @@ fn prepare_surfaces(
                             meshes.len() - 1
                         }
                         None => {
-                            eprintln!(
-                                "Not rendered: {} decal on {geometry:?} part {} (projection not ported)",
-                                decal.texture.display(),
-                                part.name
-                            );
+                            unported_decals += 1;
                             continue;
                         }
                     }
@@ -149,6 +152,11 @@ fn prepare_surfaces(
                 order,
             });
         }
+    }
+    if unported_decals > 0 {
+        eprintln!(
+            "Not rendered: {unported_decals} x decal on unported geometry (projection not ported)"
+        );
     }
     Surfaces {
         images,
@@ -170,14 +178,17 @@ fn main() -> Result<AppExit, Box<dyn std::error::Error>> {
     let model = Model::load(&path)?;
     let snapshot = SceneSnapshot::from_model(&model, &root.join("content"))?;
     println!(
-        "Loaded {}: {} instances, {} rendered parts, {} scripts retained but not executed",
+        "Loaded {}: {} instances, {} rendered parts, {} scripts",
         path.display(),
         snapshot.instance_count,
         snapshot.parts.len(),
         snapshot.script_count
     );
-    for omission in &snapshot.omissions {
-        eprintln!("Not rendered: {omission}");
+    for (kind, omission) in snapshot.omissions.iter() {
+        eprintln!(
+            "Not rendered: {} x {kind} (e.g. {})",
+            omission.count, omission.example
+        );
     }
     let prepared = prepare(
         snapshot,
@@ -190,9 +201,13 @@ fn main() -> Result<AppExit, Box<dyn std::error::Error>> {
         initial_view.pose.translation,
         initial_view.fov.to_degrees()
     );
+    let links = scripting::PartLinks::new(&prepared.snapshot.parts);
+    let host = blox_script::ScriptHost::new(model)?;
     let mut app = App::new();
     app.insert_resource(prepared)
         .insert_resource(initial_view)
+        .insert_resource(links)
+        .insert_non_send(host)
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: format!(
@@ -206,6 +221,7 @@ fn main() -> Result<AppExit, Box<dyn std::error::Error>> {
         .add_plugins(LegacyRenderPlugin)
         .add_plugins(FirstPersonPlugin)
         .add_plugins(walk::WalkPlugin)
+        .add_plugins(scripting::ScriptPlugin)
         .add_systems(Startup, setup_renderer);
     Ok(app.run())
 }
@@ -300,13 +316,41 @@ fn prepare(
     let center = (low + high) * 0.5;
     let radius = ((high - low).length() * 0.5).max(0.1);
     let surfaces = prepare_surfaces(&snapshot, &mut meshes, &mesh_indices);
+    // Terrain renders through the same legacy material; its atlas UVs are baked per vertex.
+    let terrain_atlas = blox_scene::terrain::Atlas::load(
+        &content.join("../PlatformContent/pc/terrain/materials.json"),
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+    let terrain_mesh = snapshot
+        .terrain
+        .as_ref()
+        .map(|terrain| terrain.build_mesh(&terrain_atlas))
+        .unwrap_or_default();
+    // Terrain extends the framing bounds so the camera sees the whole place.
+    let terrain_colliders: Vec<(Vec3, Vec3)> = snapshot
+        .terrain
+        .as_ref()
+        .map(blox_scene::terrain::Terrain::colliders)
+        .unwrap_or_default();
+    for &(center, half) in &terrain_colliders {
+        low = low.min(center - half);
+        high = high.max(center + half);
+    }
+    let collider_centers: Vec<Vec3> = terrain_colliders
+        .iter()
+        .map(|&(center, _)| center)
+        .collect();
+    let center = (low + high) * 0.5;
+    let radius = ((high - low).length() * 0.5).max(0.1);
     let mut shapes = HashMap::new();
     let colliders = snapshot
         .parts
         .iter()
         .zip(&mesh_indices)
         .map(|(part, &mesh)| {
-            if !part.can_collide {
+            // Zero-extent parts (degenerate SpecialMesh scale) have no volume; a zero
+            // transform scale would make Rapier produce NaN state.
+            if !part.can_collide || part.size.min_element() <= 0.0 {
                 return None;
             }
             shapes
@@ -321,6 +365,8 @@ fn prepare(
         mesh_indices,
         transforms,
         surfaces,
+        terrain: terrain_mesh,
+        terrain_colliders: collider_centers,
         center,
         radius,
         colliders,
@@ -361,10 +407,11 @@ fn setup_renderer(world: &mut World) {
     let mut textures = PlatformTextures::new(prepared.platform_textures);
     // One material per distinct appearance so Bevy can batch the thousands of parts in a place.
     let mut materials: HashMap<Vec<u32>, Handle<LegacyMaterial>> = HashMap::new();
-    for (((part, mesh_index), transform), part_image) in prepared
+    for ((((index, part), mesh_index), transform), part_image) in prepared
         .snapshot
         .parts
         .iter()
+        .enumerate()
         .zip(prepared.mesh_indices)
         .zip(&prepared.transforms)
         .zip(part_images)
@@ -377,7 +424,7 @@ fn setup_renderer(world: &mut World) {
             color: if part_image.is_some() {
                 [1.0; 3]
             } else {
-                part.color_srgb
+                part.color_srgb.to_array()
             },
             alpha: 1.0,
             specular: legacy::specular(part.material),
@@ -387,6 +434,9 @@ fn setup_renderer(world: &mut World) {
             normal: None,
             specular_map: None,
             tex: [1.0, 1.0, 1.0, 0.0],
+            detail: [0.0; 4],
+            far: [0.0; 4],
+            detail_map: None,
         };
         if lighting.outlines && block {
             appearance.flags |= legacy::FLAG_OUTLINE;
@@ -403,6 +453,11 @@ fn setup_renderer(world: &mut World) {
             if let Some(atlas) = textures.get("plastic/diffuse.dds", world) {
                 appearance.texture = Some(atlas);
                 appearance.normal = textures.get("plastic/normal.dds", world);
+                appearance.detail = [blox_scene::material::PLASTIC_TILING, 0.0, 0.0, 0.0];
+                appearance.detail_map = textures.get("plastic/normaldetail.dds", world);
+                if appearance.detail_map.is_some() {
+                    appearance.flags |= legacy::FLAG_DETAIL;
+                }
                 appearance.flags |= legacy::FLAG_STUDS;
                 if appearance.normal.is_some() {
                     appearance.flags |= legacy::FLAG_NORMAL;
@@ -426,6 +481,27 @@ fn setup_renderer(world: &mut World) {
                     material.gloss_scale,
                     material.normal_shadow,
                 ];
+                // Specular far values are CFG_SPECULAR_LOD / CFG_GLOSS_LOD, not getSpecular.
+                appearance.specular = (material.specular_lod, material.gloss_lod);
+                appearance.detail = [
+                    material.normal_detail_tiling,
+                    material.normal_detail_scale,
+                    material.far_tiling,
+                    0.0,
+                ];
+                appearance.far = [
+                    material.far_diffuse_cutoff,
+                    material.far_normal_cutoff,
+                    material.far_specular_cutoff,
+                    0.0,
+                ];
+                if material.normal_detail_scale != 0.0 {
+                    appearance.detail_map =
+                        textures.get(&format!("{folder}/normaldetail.dds"), world);
+                    if appearance.detail_map.is_some() {
+                        appearance.flags |= legacy::FLAG_DETAIL;
+                    }
+                }
                 if material.blend_color {
                     appearance.flags |= legacy::FLAG_BLEND;
                 }
@@ -463,7 +539,7 @@ fn setup_renderer(world: &mut World) {
                 hasher.finish() as u32
             })
         };
-        let key = vec![
+        let mut key = vec![
             appearance.color[0].to_bits(),
             appearance.color[1].to_bits(),
             appearance.color[2].to_bits(),
@@ -477,8 +553,16 @@ fn setup_renderer(world: &mut World) {
             handle_id(&appearance.texture),
             handle_id(&appearance.normal),
             handle_id(&appearance.specular_map),
-            appearance.tex[0].to_bits(),
+            handle_id(&appearance.detail_map),
         ];
+        key.extend(
+            appearance
+                .tex
+                .iter()
+                .chain(&appearance.detail)
+                .chain(&appearance.far)
+                .map(|v| v.to_bits()),
+        );
         let material = materials
             .entry(key)
             .or_insert_with(|| {
@@ -492,12 +576,14 @@ fn setup_renderer(world: &mut World) {
             Mesh3d(handles[mesh_index].clone()),
             MeshMaterial3d(material),
             *transform,
+            PartLink(index),
         ));
     }
-    for ((part, collider), transform) in prepared
+    for (((index, part), collider), transform) in prepared
         .snapshot
         .parts
         .iter()
+        .enumerate()
         .zip(prepared.colliders)
         .zip(&prepared.transforms)
     {
@@ -505,6 +591,7 @@ fn setup_renderer(world: &mut World) {
             world.spawn((
                 Name::new(format!("{} collider", part.name)),
                 *transform,
+                PartLink(index),
                 collider,
             ));
         }
@@ -523,6 +610,9 @@ fn setup_renderer(world: &mut World) {
                 normal: None,
                 specular_map: None,
                 tex: [1.0, 1.0, 1.0, 0.0],
+                detail: [0.0; 4],
+                far: [0.0; 4],
+                detail_map: None,
             },
         );
         material.alpha_mode = AlphaMode::Blend;
@@ -537,6 +627,75 @@ fn setup_renderer(world: &mut World) {
             Mesh3d(handles[draw.mesh].clone()),
             MeshMaterial3d(material),
             prepared.transforms[draw.part],
+            PartLink(draw.part),
+        ));
+    }
+    // The terrain atlas is one DDS shared by all terrain materials; UVs are baked per vertex.
+    let atlas_texture = world.resource_mut::<Assets<Image>>().add(
+        blox_scene::dds::load(
+            &prepared
+                .content
+                .join("../PlatformContent/pc/terrain/diffuse.dds"),
+        )
+        .expect("the terrain atlas ships with the platform content"),
+    );
+    for (terrain_mesh, is_water) in [
+        (&prepared.terrain.solid, false),
+        (&prepared.terrain.water, true),
+    ] {
+        if terrain_mesh.is_empty() {
+            continue;
+        }
+        let mut mesh = Mesh::new(
+            bevy::render::mesh::PrimitiveTopology::TriangleList,
+            bevy::asset::RenderAssetUsages::default(),
+        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, terrain_mesh.vertices.clone());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, terrain_mesh.normals.clone());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, terrain_mesh.uvs.clone());
+        mesh.insert_indices(bevy::render::mesh::Indices::U32(
+            terrain_mesh.indices.clone(),
+        ));
+        let handle = world.resource_mut::<Assets<Mesh>>().add(mesh);
+        let appearance = Appearance {
+            color: if is_water {
+                lighting.water_color
+            } else {
+                [1.0; 3]
+            },
+            alpha: if is_water {
+                1.0 - lighting.water_transparency
+            } else {
+                1.0
+            },
+            specular: legacy::specular(256),
+            flags: legacy::FLAG_TEXTURE,
+            surfaces: [0; 6],
+            texture: Some(atlas_texture.clone()),
+            normal: None,
+            specular_map: None,
+            detail: [0.0; 4],
+            far: [0.0; 4],
+            detail_map: None,
+            tex: [1.0, 1.0, 1.0, 0.0],
+        };
+        let mut material = LegacyMaterial::new(&lighting, &shading, &appearance);
+        if is_water {
+            material.alpha_mode = AlphaMode::Blend;
+        }
+        let material = world.resource_mut::<Assets<LegacyMaterial>>().add(material);
+        world.spawn((
+            Name::new(if is_water { "terrain water" } else { "terrain" }),
+            Mesh3d(handle),
+            MeshMaterial3d(material),
+        ));
+    }
+    for center in &prepared.terrain_colliders {
+        // Cells are 4 studs, so half extents are 2.
+        world.spawn((
+            Name::new("terrain collider"),
+            Transform::from_translation(*center),
+            bevy_rapier3d::prelude::Collider::cuboid(2.0, 2.0, 2.0),
         ));
     }
     let initial = world
@@ -576,7 +735,8 @@ fn setup_renderer(world: &mut World) {
     // Only the direction and shadow map are used; legacy colors come from `LegacyMaterial`.
     world.spawn((
         DirectionalLight {
-            shadow_maps_enabled: true,
+            // GlobalShadows defaults off (Lighting.cpp); SceneUpdater draws no shadow map then.
+            shadow_maps_enabled: lighting.global_shadows,
             illuminance: 10_000.0,
             ..default()
         },

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -10,6 +10,7 @@ pub mod decal;
 pub mod lighting;
 pub mod material;
 pub mod mesh;
+pub mod terrain;
 pub mod texture;
 
 use blox_model::{Model, ModelError, ModelInstance, ModelResult, Property, brick_color};
@@ -69,11 +70,14 @@ pub struct PartSnapshot {
     pub instance_id: u64,
     pub name: String,
     pub position: Vec3,
+    /// Mesh `Offset` in part space. `position` already includes `rotation * mesh_offset`; a
+    /// moved part recomputes it from the new CFrame.
+    pub mesh_offset: Vec3,
     pub rotation: Quat,
     pub size: Vec3,
     pub geometry: Geometry,
     /// Part color. Ignored by the renderer when `texture` is set, as in GeometryGenerator.cpp.
-    pub color_srgb: [f32; 3],
+    pub color_srgb: Vec3,
     pub transparency: f32,
     pub reflectance: f32,
     /// `TextureId` of the part's SpecialMesh/FileMesh, resolved to a local file.
@@ -93,10 +97,50 @@ pub struct PartSnapshot {
     pub plain_shape: bool,
 }
 
+/// Content the viewer does not draw, grouped by kind. A place can reference thousands of
+/// unfetched assets, so the load reports one line per kind with a count and one example.
+#[derive(Debug, Default, Clone)]
+pub struct Omissions {
+    kinds: BTreeMap<String, Omission>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Omission {
+    pub count: usize,
+    pub example: String,
+}
+
+impl Omissions {
+    pub fn push(&mut self, kind: impl Into<String>, example: impl Into<String>) {
+        self.kinds
+            .entry(kind.into())
+            .or_insert_with(|| Omission {
+                count: 0,
+                example: example.into(),
+            })
+            .count += 1;
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Omission)> {
+        self.kinds
+            .iter()
+            .map(|(kind, omission)| (kind.as_str(), omission))
+    }
+
+    /// `kind xN (e.g. example)` entries joined with `; `.
+    pub fn summary(&self) -> String {
+        self.iter()
+            .map(|(kind, o)| format!("{kind} x{} (e.g. {})", o.count, o.example))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
 #[derive(Resource, Debug)]
 pub struct SceneSnapshot {
     pub parts: Vec<PartSnapshot>,
-    pub omissions: Vec<String>,
+    pub terrain: Option<terrain::Terrain>,
+    pub omissions: Omissions,
     pub instance_count: usize,
     pub script_count: usize,
 }
@@ -105,8 +149,9 @@ impl SceneSnapshot {
     pub fn from_model(model: &Model, content: &Path) -> ModelResult<Self> {
         let mut meshes = HashMap::new();
         let mut decal_children: HashMap<&str, Vec<&ModelInstance>> = HashMap::new();
-        let mut omissions = Vec::new();
+        let mut omissions = Omissions::default();
         let mut script_count = 0;
+        let mut terrain = None;
         for instance in &model.instances {
             match instance.class.as_str() {
                 "SpecialMesh" | "BlockMesh" | "CylinderMesh" | "FileMesh" => {
@@ -123,12 +168,18 @@ impl SceneSnapshot {
                     }
                 }
                 "Script" | "LocalScript" | "ModuleScript" => script_count += 1,
-                "Terrain" | "ParticleEmitter" | "Smoke" | "Fire" | "Sparkles" | "PointLight"
-                | "SpotLight" | "SurfaceLight" | "BillboardGui" | "SurfaceGui" | "ScreenGui" => {
-                    omissions.push(format!(
-                        "{} {}: not rendered",
-                        instance.class, instance.name
-                    ));
+                "Terrain" => {
+                    // The `Terrain` instance is a service-like singleton; only one is expected.
+                    if terrain.is_none() {
+                        terrain = decode_terrain(instance, &mut omissions)?;
+                    }
+                }
+                "ParticleEmitter" | "Smoke" | "Fire" | "Sparkles" | "PointLight" | "SpotLight"
+                | "SurfaceLight" | "BillboardGui" | "SurfaceGui" | "ScreenGui" => {
+                    omissions.push(
+                        format!("{} not rendered", instance.class),
+                        format!("{} {}", instance.class, instance.name),
+                    );
                 }
                 _ => {}
             }
@@ -146,18 +197,16 @@ impl SceneSnapshot {
                 "WedgePart" => Geometry::Wedge,
                 "CornerWedgePart" => Geometry::CornerWedge,
                 "MeshPart" | "UnionOperation" | "NegateOperation" | "TrussPart" => {
-                    omissions.push(format!(
-                        "{} {}: geometry not implemented",
-                        instance.class, instance.name
-                    ));
+                    omissions.push(
+                        format!("{} geometry not implemented", instance.class),
+                        format!("{} {}", instance.class, instance.name),
+                    );
                     continue;
                 }
                 _ => continue,
             };
             let (position, matrix) = match property(instance, &["CFrame", "CoordinateFrame"]) {
-                Some(Property::CFrame { position, rotation }) => {
-                    (Vec3::from_array(*position), matrix(*rotation))
-                }
+                Some(Property::CFrame { position, rotation }) => (*position, *rotation),
                 None => (Vec3::ZERO, Mat3::IDENTITY),
                 _ => return Err(error(instance, "CFrame has an incompatible property type")),
             };
@@ -169,44 +218,45 @@ impl SceneSnapshot {
             }
             let rotation = Quat::from_mat3(&matrix).normalize();
             let mut position = position;
+            let mut mesh_offset = Vec3::ZERO;
             // PartInstance.h defaults to Vector3(4, 1.2, 2); XML size is already in studs.
             let mut size = vector(instance, &["size", "Size", "siz"], Vec3::new(4.0, 1.2, 2.0))?;
             if let Some(mesh) = meshes.get(instance.referent.as_str()) {
                 let scale = vector(mesh, &["Scale"], Vec3::ONE)?.abs();
                 let offset = vector(mesh, &["Offset"], Vec3::ZERO)?;
                 position += rotation * offset;
-                geometry = match mesh.class.as_str() {
-                    "BlockMesh" => Geometry::Block,
-                    "CylinderMesh" => Geometry::VerticalCylinder,
-                    "FileMesh" => match local_mesh(mesh, content)? {
-                        Some(path) => Geometry::File(path),
-                        None => {
-                            omissions.push(format!("{}: remote or missing MeshId", instance.name));
-                            continue;
-                        }
+                mesh_offset = offset;
+                // A mesh that cannot be located degrades to the part geometry,
+                // matching the legacy generator's proxy fallback when an asset
+                // is unavailable, instead of failing the whole place load.
+                let missing_mesh = |omissions: &mut Omissions| {
+                    omissions.push(
+                        "mesh asset not available; drawn as its part geometry",
+                        format!("{} {} for {}", mesh.class, mesh.name, instance.name),
+                    );
+                };
+                match mesh.class.as_str() {
+                    "BlockMesh" => geometry = Geometry::Block,
+                    "CylinderMesh" => geometry = Geometry::VerticalCylinder,
+                    "FileMesh" => match local_mesh(mesh, content, &mut omissions)? {
+                        Some(path) => geometry = Geometry::File(path),
+                        None => missing_mesh(&mut omissions),
                     },
                     _ => match number(mesh, &["MeshType"], 0.0)? as u32 {
-                        0 => Geometry::Head,
-                        1 => Geometry::Torso,
-                        2 => Geometry::Wedge,
-                        3 => Geometry::Ball,
-                        4 => Geometry::Cylinder,
-                        5 => match local_mesh(mesh, content)? {
-                            Some(path) => Geometry::File(path),
-                            None => {
-                                omissions
-                                    .push(format!("{}: remote or missing MeshId", instance.name));
-                                continue;
-                            }
+                        0 => geometry = Geometry::Head,
+                        1 => geometry = Geometry::Torso,
+                        2 => geometry = Geometry::Wedge,
+                        3 => geometry = Geometry::Ball,
+                        4 => geometry = Geometry::Cylinder,
+                        5 => match local_mesh(mesh, content, &mut omissions)? {
+                            Some(path) => geometry = Geometry::File(path),
+                            None => missing_mesh(&mut omissions),
                         },
-                        6 => Geometry::Block,
-                        other => {
-                            omissions.push(format!(
-                                "{}: unsupported SpecialMesh type {other}",
-                                instance.name
-                            ));
-                            continue;
-                        }
+                        6 => geometry = Geometry::Block,
+                        other => omissions.push(
+                            "unsupported SpecialMesh type; drawn as its part geometry",
+                            format!("{}: type {other}", instance.name),
+                        ),
                     },
                 };
                 if matches!(geometry, Geometry::File(_)) {
@@ -219,7 +269,9 @@ impl SceneSnapshot {
                     size *= scale;
                 }
             }
-            if !size.is_finite() || size.min_element() <= 0.0 {
+            // GeometryGenerator.cpp::getMeshScale does not reject zero scale; a zero axis
+            // yields degenerate geometry that draws nothing.
+            if !size.is_finite() || size.min_element() < 0.0 {
                 return Err(error(instance, "invalid part or mesh size"));
             }
             let color_srgb = match property(instance, &["Color3uint8", "Color3", "Color"]) {
@@ -227,22 +279,25 @@ impl SceneSnapshot {
                 Some(_) => return Err(error(instance, "unsupported color encoding")),
                 None => {
                     let color = number(instance, &["BrickColor"], 194.0)? as u32;
-                    brick_color::rgb(color)
-                        .ok_or_else(|| error(instance, &format!("unknown BrickColor {color}")))?
+                    let rgb = brick_color::rgb(color)
+                        .ok_or_else(|| error(instance, &format!("unknown BrickColor {color}")))?;
+                    Vec3::from_array(rgb)
                 }
             };
             let transparency = number(instance, &["Transparency"], 0.0)? as f32;
             let reflectance = number(instance, &["Reflectance"], 0.0)? as f32;
-            if color_srgb
-                .iter()
-                .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
-                || !transparency.is_finite()
-                || !(0.0..=1.0).contains(&transparency)
-                || !reflectance.is_finite()
-                || !(0.0..=1.0).contains(&reflectance)
-            {
+            if !(color_srgb.is_finite() && transparency.is_finite()) {
                 return Err(error(instance, "invalid material values"));
             }
+            if !reflectance.is_finite() {
+                return Err(error(instance, "invalid reflectance"));
+            }
+            // Real 2016 places store transparency and reflectance outside 0..1
+            // (e.g. -0.1 and 2.0). The legacy renderer clamps rather than
+            // rejecting: getBaseColor clamps alpha from getTransparencyUi, and
+            // PartCookie.h::getPartReflectance does clamp(reflectance, 0, 1).
+            let transparency = transparency.clamp(0.0, 1.0);
+            let reflectance = reflectance.clamp(0.0, 1.0);
             let part_mesh = meshes.get(instance.referent.as_str());
             let mut texture = None;
             if let Some(mesh) =
@@ -264,9 +319,11 @@ impl SceneSnapshot {
                     .filter(|_| face.fract() == 0.0)
                     .ok_or_else(|| error(decal, "invalid Face"))?;
                 let decal_transparency = number(decal, &["Transparency"], 0.0)? as f32;
-                if !(0.0..=1.0).contains(&decal_transparency) {
+                if !decal_transparency.is_finite() {
                     return Err(error(decal, "invalid decal Transparency"));
                 }
+                // Legacy getBaseColor clamps decal alpha the same way as parts.
+                let decal_transparency = decal_transparency.clamp(0.0, 1.0);
                 let studs_per_tile = if decal.class == "Texture" {
                     let u = number(decal, &["StudsPerTileU"], 2.0)? as f32;
                     let v = number(decal, &["StudsPerTileV"], 2.0)? as f32;
@@ -288,6 +345,7 @@ impl SceneSnapshot {
                 instance_id: index as u64 + 1,
                 name: instance.name.clone(),
                 position,
+                mesh_offset,
                 rotation,
                 size,
                 geometry,
@@ -308,19 +366,63 @@ impl SceneSnapshot {
                     .is_some_and(|m| matches!(m.class.as_str(), "BlockMesh" | "CylinderMesh")),
             });
         }
-        if parts.is_empty() {
+        if parts.is_empty() && terrain.as_ref().is_none_or(terrain::Terrain::is_empty) {
             return Err(ModelError(format!(
                 "model has no supported renderable parts; {}",
-                omissions.join("; ")
+                omissions.summary()
             )));
         }
         Ok(Self {
             parts,
+            terrain,
             omissions,
             instance_count: model.instances.len(),
             script_count,
         })
     }
+}
+
+/// Decodes a `Terrain` instance's payload: `ClusterGridV3`/`ClusterGridV2`, or reports the modern
+/// `SmoothGrid` that is not decoded yet.
+fn decode_terrain(
+    instance: &ModelInstance,
+    omissions: &mut Omissions,
+) -> ModelResult<Option<terrain::Terrain>> {
+    let payload = |name: &str| match instance.properties.get(name) {
+        Some(Property::Binary(bytes)) if !bytes.is_empty() => Some(bytes.as_slice()),
+        _ => None,
+    };
+    let grid = match (payload("ClusterGridV3"), payload("ClusterGridV2")) {
+        (Some(bytes), _) => terrain::Terrain::from_cluster_grid_v3(bytes),
+        (None, Some(bytes)) => terrain::Terrain::from_cluster_grid_v2(bytes),
+        (None, None) => {
+            if let Some(bytes) = payload("SmoothGrid") {
+                omissions.push(
+                    "SmoothGrid terrain not decoded",
+                    format!(
+                        "{} {}: {} bytes",
+                        instance.class,
+                        instance.name,
+                        bytes.len()
+                    ),
+                );
+            }
+            return Ok(None);
+        }
+    };
+    let mut grid = grid.map_err(|e| error(instance, &format!("invalid terrain grid: {}", e.0)))?;
+    let (origin, rotation) = match property(instance, &["CFrame", "CoordinateFrame"]) {
+        Some(Property::CFrame { position, rotation }) => (*position, *rotation),
+        None => (Vec3::ZERO, Mat3::IDENTITY),
+        _ => {
+            return Err(error(
+                instance,
+                "Terrain CFrame has an incompatible property type",
+            ));
+        }
+    };
+    grid.set_frame(origin, rotation);
+    Ok(Some(grid))
 }
 
 fn property<'a>(instance: &'a ModelInstance, names: &[&str]) -> Option<&'a Property> {
@@ -340,7 +442,7 @@ fn number(instance: &ModelInstance, names: &[&str], default: f64) -> ModelResult
 }
 fn vector(instance: &ModelInstance, names: &[&str], default: Vec3) -> ModelResult<Vec3> {
     match property(instance, names) {
-        Some(Property::Vector3(value)) => Ok(Vec3::from_array(*value)),
+        Some(Property::Vector3(value)) => Ok(*value),
         None => Ok(default),
         _ => Err(error(
             instance,
@@ -377,15 +479,32 @@ fn content_ref(instance: &ModelInstance, name: &str, content: &Path) -> ModelRes
     Ok(ContentRef::Local(content.join(relative)))
 }
 
-fn local_mesh(instance: &ModelInstance, content: &Path) -> ModelResult<Option<PathBuf>> {
-    match content_ref(instance, "MeshId", content)? {
-        ContentRef::Null | ContentRef::Remote(_) => Ok(None),
-        ContentRef::Local(path) if !path.is_file() => Err(error(
-            instance,
-            &format!("mesh asset missing: {}", path.display()),
-        )),
-        ContentRef::Local(path) => Ok(Some(path)),
-    }
+/// Locates a local `rbxasset://` mesh. Remote ids and ids that resolve outside
+/// the content tree (custom uploads such as `rbxasset://fonts/…`) return
+/// `None` and are reported, matching how textures are handled.
+fn local_mesh(
+    instance: &ModelInstance,
+    content: &Path,
+    omissions: &mut Omissions,
+) -> ModelResult<Option<PathBuf>> {
+    Ok(match content_ref(instance, "MeshId", content)? {
+        ContentRef::Null => None,
+        ContentRef::Local(path) if path.is_file() => Some(path),
+        ContentRef::Local(path) => {
+            omissions.push(
+                "mesh asset missing",
+                format!("{} {}: {}", instance.class, instance.name, path.display()),
+            );
+            None
+        }
+        ContentRef::Remote(id) => {
+            omissions.push(
+                "remote MeshId not fetched",
+                format!("{} {}: {id}", instance.class, instance.name),
+            );
+            None
+        }
+    })
 }
 
 /// Null textures draw nothing; remote or missing ones are reported and skipped.
@@ -393,24 +512,22 @@ fn resolve_texture(
     instance: &ModelInstance,
     name: &str,
     content: &Path,
-    omissions: &mut Vec<String>,
+    omissions: &mut Omissions,
 ) -> ModelResult<Option<PathBuf>> {
     Ok(match content_ref(instance, name, content)? {
         ContentRef::Null => None,
         ContentRef::Remote(id) => {
-            omissions.push(format!(
-                "{} {}: remote {name} {id} not fetched",
-                instance.class, instance.name
-            ));
+            omissions.push(
+                format!("remote {name} not fetched"),
+                format!("{} {}: {id}", instance.class, instance.name),
+            );
             None
         }
         ContentRef::Local(path) if !path.is_file() => {
-            omissions.push(format!(
-                "{} {}: {name} missing: {}",
-                instance.class,
-                instance.name,
-                path.display()
-            ));
+            omissions.push(
+                format!("{name} missing"),
+                format!("{} {}: {}", instance.class, instance.name, path.display()),
+            );
             None
         }
         ContentRef::Local(path) => Some(path),
@@ -444,13 +561,6 @@ fn surface_types(instance: &ModelInstance) -> ModelResult<[u8; 6]> {
         *slot = value as u8;
     }
     Ok(out)
-}
-fn matrix(rows: [[f32; 3]; 3]) -> Mat3 {
-    Mat3::from_cols(
-        Vec3::new(rows[0][0], rows[1][0], rows[2][0]),
-        Vec3::new(rows[0][1], rows[1][1], rows[2][1]),
-        Vec3::new(rows[0][2], rows[1][2], rows[2][2]),
-    )
 }
 fn error(instance: &ModelInstance, message: &str) -> ModelError {
     ModelError(format!(
@@ -516,8 +626,18 @@ mod tests {
         assert_eq!(texture.face, Face::Top);
         assert_eq!(texture.studs_per_tile, Some([4.0, 2.0]));
         assert_eq!(texture.transparency, 0.25);
-        assert!(scene.omissions.iter().any(|o| o.contains("remote Texture")));
-        assert!(scene.omissions.iter().any(|o| o.contains("does-not-exist")));
+        assert!(
+            scene
+                .omissions
+                .iter()
+                .any(|(kind, _)| kind == "remote Texture not fetched")
+        );
+        assert!(
+            scene
+                .omissions
+                .iter()
+                .any(|(_, o)| o.example.contains("does-not-exist"))
+        );
     }
 
     #[test]
@@ -551,7 +671,6 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         for property in [
             r#"<token name="Face">6</token>"#,
-            r#"<float name="Transparency">1.5</float>"#,
             r#"<float name="StudsPerTileU">0</float>"#,
         ] {
             let xml = format!(
@@ -567,6 +686,28 @@ mod tests {
             );
         }
     }
+
+    /// Real 2016 places store transparency above 1 (2.0 appears in slender.rbxl)
+    /// and reflectance below 0 (-0.1). The legacy renderer clamps both -
+    /// `getBaseColor` clamps alpha and `PartCookie.h` does clamp(reflectance,0,1)
+    /// - so these are clamped rather than rejected.
+    #[test]
+    fn out_of_range_transparency_and_reflectance_are_clamped() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let xml = r#"<roblox version="4"><Item class="Part" referent="p"><Properties>
+            <float name="Transparency">2.0</float>
+            <float name="Reflectance">-0.1</float>
+          </Properties>
+          <Item class="Decal" referent="d"><Properties>
+            <float name="Transparency">1.5</float>
+            <Content name="Texture"><url>rbxasset://textures/face.png</url></Content>
+          </Properties></Item></Item></roblox>"#;
+        let model = Model::decode(xml.as_bytes()).unwrap();
+        let scene = SceneSnapshot::from_model(&model, &root.join("content")).unwrap();
+        assert_eq!(scene.parts[0].transparency, 1.0);
+        assert_eq!(scene.parts[0].reflectance, 0.0);
+        assert_eq!(scene.parts[0].decals[0].transparency, 1.0);
+    }
     #[test]
     fn actual_character_uses_serialized_world_transforms_colors_and_head_mesh() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
@@ -577,7 +718,7 @@ mod tests {
         assert_eq!(head.geometry, Geometry::Head);
         assert_eq!(
             head.color_srgb,
-            [245.0 / 255.0, 205.0 / 255.0, 48.0 / 255.0]
+            Vec3::new(245.0 / 255.0, 205.0 / 255.0, 48.0 / 255.0)
         );
         assert!(
             head.rotation
@@ -594,7 +735,7 @@ mod tests {
         assert_eq!(torso.size, Vec3::new(2.0, 2.0, 1.0));
         assert_eq!(
             torso.color_srgb,
-            [13.0 / 255.0, 105.0 / 255.0, 172.0 / 255.0]
+            Vec3::new(13.0 / 255.0, 105.0 / 255.0, 172.0 / 255.0)
         );
     }
 }
